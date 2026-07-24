@@ -191,6 +191,25 @@ namespace OpenOrbitalOptimizer {
     /// Orbital energies, updated each iteration from the lowest-energy solution
     OrbitalOccupations<Tbase> orbital_occupations_;
 
+    /// Cache: AO-basis DIIS commutator ``FP - PF`` per history entry,
+    /// keyed by the entry's stable iteration index (returned by
+    /// ``get_index()``) and populated lazily. Dot products of these
+    /// commutators are invariant under the ``C^dagger ... C`` projection
+    /// used by ``diis_residual`` (full natural-orbital basis is
+    /// unitary), so the same cache serves ``diis_error_matrix_element``.
+    /// Cleared by ``clear_diis_caches_()`` on history reset; stale
+    /// entries otherwise linger until then, which is fine given each
+    /// entry is O(n_basis^2) memory and history depths are small.
+    mutable std::map<size_t, std::vector<Matrix<Torb>>> diis_commutator_cache_;
+
+    /// Cache: sum-over-blocks ``tr(D_a * F_b)``, keyed by the two
+    /// entries' stable iteration indices. Every ADIIS / EDIIS matrix
+    /// element is a linear combination of at most four of these
+    /// primitives, so caching them collapses the ``nhist^2`` per-block
+    /// rebuild of the linear/quadratic-term matrices into ``O(nhist)``
+    /// new fills per iteration.
+    mutable std::map<std::pair<size_t, size_t>, Tbase> trace_DF_cache_;
+
     /// Number of Fock matrix evaluations
     size_t number_of_fock_evaluations_ = 0;
 
@@ -684,25 +703,90 @@ namespace OpenOrbitalOptimizer {
       return mat;
     }
 
+    /// Empty the DIIS caches. Called on any operation that invalidates
+    /// history entries (initialize_with_*, reset_history).
+    void clear_diis_caches_() const {
+      diis_commutator_cache_.clear();
+      trace_DF_cache_.clear();
+    }
+
+    /// AO-basis commutator ``FP - PF`` for a history entry / block,
+    /// lazily built via the rank-k route
+    ///   FP = F * (C_occ * diag(n_occ) * C_occ^dagger)
+    ///   PF = (FP)^dagger      (F, P Hermitian)
+    /// so the build is ``O(k * n_basis^2)`` in place of the naive
+    /// ``O(n_basis^3)`` two-matmul form. Cached by the entry's stable
+    /// iteration index so subsequent DIIS-matrix accesses at the same
+    /// entry cost nothing.
+    const Matrix<Torb> &
+    diis_commutator_cached_(size_t ihist, size_t iblock) const {
+      const size_t idx = get_index(ihist);
+      auto & blocks = diis_commutator_cache_[idx];
+      if(blocks.empty())
+        blocks.resize(number_of_blocks_);
+      if(blocks[iblock].size() != 0)
+        return blocks[iblock];
+
+      auto F = get_fock_matrix_block(ihist, iblock);
+      Matrix<Torb> F_sym = (Tbase(1)/Tbase(2)) * (F + F.adjoint());
+
+      // Extract occupied natural orbitals for the rank-k FP build.
+      const auto C_full = get_orbital_block(ihist, iblock);
+      const auto occ    = get_orbital_occupation_block(ihist, iblock);
+      const Tbase tol   = Tbase(10) * maximum_occupation_(iblock)
+                        * std::numeric_limits<Tbase>::epsilon();
+      Index n_active = 0;
+      for(Index k = 0; k < occ.size(); k++)
+        if(std::abs(occ(k)) > tol) ++n_active;
+      Matrix<Torb> C_active(C_full.rows(), n_active);
+      Vector<Tbase> n_active_vals(n_active);
+      Index col = 0;
+      for(Index k = 0; k < occ.size(); k++)
+        if(std::abs(occ(k)) > tol) {
+          C_active.col(col)  = C_full.col(k);
+          n_active_vals(col) = occ(k);
+          ++col;
+        }
+      if(n_active == 0) {
+        blocks[iblock] = Matrix<Torb>::Zero(F_sym.rows(), F_sym.cols());
+        return blocks[iblock];
+      }
+      Matrix<Torb> FC = F_sym * C_active;                  // O(N^2 * k)
+      Matrix<Torb> FP = FC * n_active_vals.asDiagonal()
+                     * C_active.adjoint();                 // O(N^2 * k)
+      // PF = (FP)^dagger since F and P are Hermitian.
+      blocks[iblock] = FP - FP.adjoint();
+      return blocks[iblock];
+    }
+
+    /// Sum over blocks of ``tr(D_a * F_b)`` for the given history
+    /// entries, cached by (idx_a, idx_b).
+    Tbase trace_DF_cached_(size_t ihist_a, size_t ihist_b) const {
+      const size_t idx_a = get_index(ihist_a);
+      const size_t idx_b = get_index(ihist_b);
+      const auto key = std::make_pair(idx_a, idx_b);
+      auto it = trace_DF_cache_.find(key);
+      if(it != trace_DF_cache_.end()) return it->second;
+      Tbase tr = Tbase(0);
+      for(size_t iblock = 0; iblock < number_of_blocks_; iblock++) {
+        if(empty_block(iblock)) continue;
+        tr += tr_of_product_(
+            get_density_matrix_block(ihist_a, iblock),
+            get_fock_matrix_block(ihist_b, iblock));
+      }
+      trace_DF_cache_[key] = tr;
+      return tr;
+    }
+
     /// Compute DIIS residual
     Matrix<Torb> diis_residual(size_t ihist, size_t iblock) const {
-      // Error is measured by FPS-SPF = FP - PF, since we have a unit metric.
-      auto F = get_fock_matrix_block(ihist, iblock);
-      auto P = get_density_matrix_block(ihist, iblock);
-
-      // Though F and P should be symmetric by construction, explicitly symmetrize
-      // them and compute commutator to avoid symmetry-related numerical issues.
-      Matrix<Torb> F_sym = Tbase(1)/Tbase(2) * (F + F.adjoint());
-      Matrix<Torb> P_sym = Tbase(1)/Tbase(2) * (P + P.adjoint());
-      Matrix<Torb> PF = P_sym * F_sym;
-      Matrix<Torb> FP = F_sym * P_sym;
-      Matrix<Torb> commutator = PF - FP;
-
-      // To make the L^infty error independent of the underlying basis
-      // set, we project the residual into the best orbitals we have
+      // FPS - SPF (S = I) commutator lives on the cache with the
+      // ``FP - PF`` sign convention. Project into the current
+      // reference natural orbitals so the L^infty norm stays
+      // basis-independent, matching the pre-cache semantics.
+      const Matrix<Torb> & X = diis_commutator_cached_(ihist, iblock);
       auto C = get_orbital_block(0, iblock);
-      commutator = C.adjoint() * commutator * C;
-      return commutator;
+      return C.adjoint() * X * C;
     }
 
     /// Compute DIIS residual
@@ -780,13 +864,20 @@ namespace OpenOrbitalOptimizer {
 
     /// Compute element of DIIS error matrix
     Tbase diis_error_matrix_element(size_t ihist, size_t jhist) const {
+      // dot(e_i, e_j) = Re(tr((C^dagger X_i C)^dagger (C^dagger X_j C))).
+      // C is unitary (full natural-orbital basis) so this reduces to
+      //   Re(tr(X_i^dagger X_j)) = -Re(tr(X_i X_j))
+      // using the anti-Hermitian property X^dagger = -X. That last
+      // form goes straight through the cache -- no per-call
+      // projection into the current reference orbitals -- and picks
+      // up the O(nhist^2) reuse over an SCF run.
       Tbase el=Tbase(0);
       for(size_t iblock=0; iblock<number_of_blocks_; iblock++) {
         if(empty_block(iblock))
           continue;
-        Vector<Tbase> ei(diis_error_vector(ihist, iblock));
-        Vector<Tbase> ej(diis_error_vector(jhist, iblock));
-        el += ei.dot(ej);
+        const Matrix<Torb> & Xi = diis_commutator_cached_(ihist, iblock);
+        const Matrix<Torb> & Xj = diis_commutator_cached_(jhist, iblock);
+        el -= tr_of_product_(Xi, Xj);
       }
       return el;
     }
@@ -895,10 +986,10 @@ namespace OpenOrbitalOptimizer {
       /// Make initial guesses for parameters
       std::vector<Vector<Tbase>> xguess;
       // Center point
-      xguess.push_back(Vector<Tbase>::Constant(b.size(), Tbase(Tbase(1))/b.size()));
+      xguess.push_back(Vector<Tbase>::Constant(b.size(), Tbase(1)/b.size()));
       // "Gauss" points
       for(Index i=0;i<b.size();i++) {
-        Vector<Tbase> xtr = Vector<Tbase>::Constant(b.size(), Tbase(Tbase(1))/(b.size()+2));
+        Vector<Tbase> xtr = Vector<Tbase>::Constant(b.size(), Tbase(1)/(b.size()+2));
         xtr(i) *= 3;
         xguess.push_back(xtr);
       }
@@ -1025,20 +1116,16 @@ namespace OpenOrbitalOptimizer {
       return x;
     }
 
-    /// ADIIS linear term: <D_i - D_0 | F_i - F_0>
+    /// ADIIS linear term: <D_i - D_0 | F_0>
     Vector<Tbase> adiis_linear_term() const {
-      Vector<Tbase> ret = Vector<Tbase>::Zero(orbital_history_.size());
-      for(size_t iblock=0;iblock<number_of_blocks_;iblock++) {
-        if(empty_block(iblock))
-          continue;
-        const auto & Dn = get_density_matrix_block(0, iblock);
-        const auto & Fn = get_fock_matrix_block(0, iblock);
-        for(Index ihist=0;ihist<ret.size();ihist++) {
-          // D_i - D_n
-          Matrix<Torb> dD(get_density_matrix_block(ihist, iblock) - Dn);
-          ret(ihist) += Tbase(Tbase(2))*tr_of_product_(dD, Fn);
-        }
-      }
+      // 2 * (tr(D_i F_0) - tr(D_0 F_0)) per history entry -- both
+      // primitives live in trace_DF_cache_ and are shared with the
+      // ADIIS/EDIIS quadratic-term builders.
+      const size_t nhist = orbital_history_.size();
+      const Tbase tD0_F0 = trace_DF_cached_(0, 0);
+      Vector<Tbase> ret(nhist);
+      for(size_t ihist = 0; ihist < nhist; ihist++)
+        ret(ihist) = Tbase(2) * (trace_DF_cached_(ihist, 0) - tD0_F0);
       return ret;
     }
 
@@ -1051,26 +1138,21 @@ namespace OpenOrbitalOptimizer {
       return ret;
     }
 
-    /// ADIIS quadratic term: <D_i - D_n | F_j - F_n>
+    /// ADIIS quadratic term: <D_i - D_0 | F_j - F_0>
     Matrix<Tbase> adiis_quadratic_term() const {
+      // Expand: tr((D_i - D_0)(F_j - F_0)) = tr(D_i F_j) - tr(D_i F_0)
+      //                                    - tr(D_0 F_j) + tr(D_0 F_0)
+      // All four primitives are cached via trace_DF_cached_.
       const size_t nhist = orbital_history_.size();
-      Matrix<Tbase> ret = Matrix<Tbase>::Zero(nhist, nhist);
-      for(size_t iblock=0;iblock<number_of_blocks_;iblock++) {
-        if(empty_block(iblock))
-          continue;
-        const auto & Dn = get_density_matrix_block(0, iblock);
-        const auto & Fn = get_fock_matrix_block(0, iblock);
-        // Precompute (D_i - D_n) and (F_j - F_n) once per history
-        // entry; the doubly-nested loop below would otherwise re-
-        // materialise the same density matrix nhist times.
-        std::vector<Matrix<Torb>> dD(nhist), dF(nhist);
-        for(size_t ihist=0;ihist<nhist;ihist++) {
-          dD[ihist] = get_density_matrix_block(ihist, iblock) - Dn;
-          dF[ihist] = get_fock_matrix_block(ihist, iblock) - Fn;
+      const Tbase tD0_F0 = trace_DF_cached_(0, 0);
+      Matrix<Tbase> ret(nhist, nhist);
+      for(size_t ihist=0; ihist<nhist; ihist++) {
+        const Tbase tDi_F0 = trace_DF_cached_(ihist, 0);
+        for(size_t jhist=0; jhist<nhist; jhist++) {
+          const Tbase tD0_Fj = trace_DF_cached_(0, jhist);
+          ret(ihist, jhist) = trace_DF_cached_(ihist, jhist)
+                            - tDi_F0 - tD0_Fj + tD0_F0;
         }
-        for(size_t ihist=0;ihist<nhist;ihist++)
-          for(size_t jhist=0;jhist<nhist;jhist++)
-            ret(ihist,jhist) += tr_of_product_(dD[ihist], dF[jhist]);
       }
       // Only the symmetric part matters; we also multiply by two
       // since we define the quadratic model as 0.5*x^T A x + b x
@@ -1079,23 +1161,19 @@ namespace OpenOrbitalOptimizer {
 
     /// EDIIS quadratic term: -0.5*<D_i - D_j | F_i - F_j>
     Matrix<Tbase> ediis_quadratic_term() const {
+      // Expand: tr((D_i - D_j)(F_i - F_j)) = tr(D_i F_i) - tr(D_i F_j)
+      //                                    - tr(D_j F_i) + tr(D_j F_j)
+      // Every primitive is cached via trace_DF_cached_ and shared
+      // with the ADIIS terms.
       const size_t nhist = orbital_history_.size();
-      Matrix<Tbase> ret = Matrix<Tbase>::Zero(nhist, nhist);
-      for(size_t iblock=0;iblock<number_of_blocks_;iblock++) {
-        if(empty_block(iblock))
-          continue;
-        // Cache the block densities once; the naive doubly-nested
-        // form materialised each D_i / F_i O(nhist) times.
-        std::vector<Matrix<Torb>> D_hist(nhist);
-        for(size_t ihist=0;ihist<nhist;ihist++)
-          D_hist[ihist] = get_density_matrix_block(ihist, iblock);
-        for(size_t ihist=0;ihist<nhist;ihist++) {
-          const auto & F_i = get_fock_matrix_block(ihist, iblock);
-          for(size_t jhist=0;jhist<nhist;jhist++) {
-            Matrix<Torb> dD = D_hist[ihist] - D_hist[jhist];
-            Matrix<Torb> dF = F_i - get_fock_matrix_block(jhist, iblock);
-            ret(ihist,jhist) -= tr_of_product_(dD, dF);
-          }
+      Matrix<Tbase> ret(nhist, nhist);
+      for(size_t ihist=0; ihist<nhist; ihist++) {
+        const Tbase tDi_Fi = trace_DF_cached_(ihist, ihist);
+        for(size_t jhist=0; jhist<nhist; jhist++) {
+          const Tbase tDj_Fj = trace_DF_cached_(jhist, jhist);
+          const Tbase tDi_Fj = trace_DF_cached_(ihist, jhist);
+          const Tbase tDj_Fi = trace_DF_cached_(jhist, ihist);
+          ret(ihist, jhist) = -(tDi_Fi - tDi_Fj - tDj_Fi + tDj_Fj);
         }
       }
       // Only the symmetric part matters; the factor 0.5 already
@@ -3319,6 +3397,7 @@ namespace OpenOrbitalOptimizer {
       if(orbitals.size() != number_of_blocks_)
         throw std::logic_error("Fed in orbitals and orbital occupations do not have the required number of blocks!\n");
       orbital_history_.clear();
+      clear_diis_caches_();
 
       // Reset number of evaluations
       number_of_fock_evaluations_ = 0;
@@ -3351,6 +3430,7 @@ namespace OpenOrbitalOptimizer {
 
         // Clear out the old history
         orbital_history_.clear();
+      clear_diis_caches_();
         // and add the new entry
         add_entry(std::make_pair(new_orbitals.first, new_occupations));
       }
@@ -3739,6 +3819,7 @@ namespace OpenOrbitalOptimizer {
     void reset_history() {
       while(orbital_history_.size()>1)
         orbital_history_.pop_back();
+      clear_diis_caches_();
     }
 
     /// Computes orbitals and orbital energies by diagonalizing the Fock matrix
