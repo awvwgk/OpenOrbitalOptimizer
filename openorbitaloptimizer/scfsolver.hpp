@@ -462,6 +462,15 @@ namespace OpenOrbitalOptimizer {
         if(enabled_) oss_ << manip;
         return *this;
       }
+      /// True iff the log gate opened and writes will be flushed.
+      /// Use to short-circuit expensive formatting when the sink
+      /// would discard it anyway.
+      bool enabled() const { return enabled_; }
+      /// Direct handle on the underlying std::ostream buffer, for
+      /// helpers that write via a std::ostream& argument (e.g.
+      /// print_settings). Writes when the gate is closed still land
+      /// in oss_ but are dropped when the LogStream destructs.
+      std::ostream & stream() { return oss_; }
     private:
       const SCFSolver * solver_;
       int level_;
@@ -3801,6 +3810,15 @@ namespace OpenOrbitalOptimizer {
     /// other subsets terminate early when every allowed method has
     /// failed in succession.
     void run() {
+      // Dump the current settings once at the top of run() so a
+      // verbosity 10 trace records exactly what the solver was
+      // configured with. Route through log_stream_ so the message
+      // ends up on the caller's log sink instead of unconditionally
+      // on stdout, and skip the (non-trivial) catalog walk when the
+      // gate is closed.
+      if(auto ls = log_stream_(10); ls.enabled())
+        print_settings(ls.stream());
+
       AllowedMethods allowed = parse_method_string(methods_);
       if(frozen_occupations_)
         allowed.oda = false;  // occupations are pinned; ODA cannot move them
