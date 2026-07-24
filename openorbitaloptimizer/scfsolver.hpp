@@ -126,12 +126,12 @@ namespace OpenOrbitalOptimizer {
           T lo = x_prev, hi = x_cur;
           T ylo = y_prev, yhi = y_cur;
           for (int j = 0; j < 60; j++) {
-            T mid = T(0.5) * (lo + hi);
+            T mid = (T(1)/T(2)) * (lo + hi);
             T ymid = f(mid);
             if ((ymid >= T(0)) == (ylo >= T(0))) { lo = mid; ylo = ymid; }
             else                                 { hi = mid; yhi = ymid; }
           }
-          roots.push_back(T(0.5) * (lo + hi));
+          roots.push_back((T(1)/T(2)) * (lo + hi));
         }
         x_prev = x_cur;
         y_prev = y_cur;
@@ -191,31 +191,60 @@ namespace OpenOrbitalOptimizer {
     /// Orbital energies, updated each iteration from the lowest-energy solution
     OrbitalOccupations<Tbase> orbital_occupations_;
 
+    /// Cache: AO-basis DIIS commutator ``FP - PF`` per history entry,
+    /// keyed by the entry's stable iteration index (returned by
+    /// ``get_index()``) and populated lazily. Dot products of these
+    /// commutators are invariant under the ``C^dagger ... C`` projection
+    /// used by ``diis_residual`` (full natural-orbital basis is
+    /// unitary), so the same cache serves ``diis_error_matrix_element``.
+    /// Cleared by ``clear_diis_caches_()`` on history reset; stale
+    /// entries otherwise linger until then, which is fine given each
+    /// entry is O(n_basis^2) memory and history depths are small.
+    mutable std::map<size_t, std::vector<Matrix<Torb>>> diis_commutator_cache_;
+
+    /// Cache: sum-over-blocks ``tr(D_a * F_b)``, keyed by the two
+    /// entries' stable iteration indices. Every ADIIS / EDIIS matrix
+    /// element is a linear combination of at most four of these
+    /// primitives, so caching them collapses the ``nhist^2`` per-block
+    /// rebuild of the linear/quadratic-term matrices into ``O(nhist)``
+    /// new fills per iteration.
+    mutable std::map<std::pair<size_t, size_t>, Tbase> trace_DF_cache_;
+    /// Cache: DIIS error matrix element ``dot(e_i, e_j) = -Re(tr(X_i X_j))``,
+    /// keyed by the two entries' stable iteration indices in
+    /// ``(min, max)`` order (the matrix is symmetric).
+    mutable std::map<std::pair<size_t, size_t>, Tbase> diis_matrix_cache_;
+    /// Cache: sum-over-blocks Frobenius-norm-vectorised distance
+    /// between the density matrices of two history entries, keyed by
+    /// their stable iteration indices in ``(min, max)`` order (also
+    /// symmetric). Populated on demand by
+    /// ``density_matrix_difference``.
+    mutable std::map<std::pair<size_t, size_t>, Tbase> density_diff_cache_;
+
     /// Number of Fock matrix evaluations
     size_t number_of_fock_evaluations_ = 0;
 
     /// Maximum number of iterations
     size_t maximum_iterations_ = 128;
     /// Start to mix in DIIS at this error threshold (Garza and Scuseria, 2012)
-    Tbase diis_epsilon_ = 1e-1;
+    Tbase diis_epsilon_ = Tbase(1e-1);
     /// Threshold for pure DIIS (Garza and Scuseria, 2012)
-    Tbase diis_threshold_ = 1e-4;
+    Tbase diis_threshold_ = Tbase(1e-4);
     /// Damping factor for DIIS diagonal (Hamilton and Pulay, 1986)
-    Tbase diis_diagonal_damping_ = 0.02;
+    Tbase diis_diagonal_damping_ = Tbase(0.02);
     /// DIIS restart criterion (Chupin et al, 2021)
-    Tbase diis_restart_factor_ = 1e-4;
+    Tbase diis_restart_factor_ = Tbase(1e-4);
 
     /// Criterion for max error for which to use optimal damping
-    Tbase optimal_damping_threshold_ = 1.0;
+    Tbase optimal_damping_threshold_ = Tbase(1);
 
     /// History cleanup criterion: keep only those density matrices that satisfy delta ||P0-Pi|| < min_{j>0} ||P0-Pj||
-    Tbase density_restart_factor_ = 1e-4;
+    Tbase density_restart_factor_ = Tbase(1e-4);
     /// History length
     int maximum_history_length_ = 10;
     /// Steps with no DIIS energy improvement after which to use ODA. Previously maximum_history_length_/2
     int oda_restart_steps_ = 5;
     /// Convergence threshold for orbital gradient
-    Tbase convergence_threshold_ = 1e-7;
+    Tbase convergence_threshold_ = Tbase(1e-7);
     /// Safety factor K for the arithmetic-precision clamp on the
     /// effective convergence threshold: the SCF is considered
     /// converged when the DIIS error drops below
@@ -240,9 +269,9 @@ namespace OpenOrbitalOptimizer {
     std::string methods_ = "DIIS + ODA + CG";
 
     /// Minimal normalized projection of preconditioned search direction onto gradient
-    Tbase minimal_gradient_projection_ = 1e-4;
+    Tbase minimal_gradient_projection_ = Tbase(1e-4);
     /// Threshold for detection of occupied orbitals
-    Tbase occupied_threshold_ = 1e-6;
+    Tbase occupied_threshold_ = Tbase(1e-6);
     /// Initial level shift used as the floor in the orbital-rotation
     /// preconditioner:
     ///     d_alpha = -g_alpha / (sigma + max(0, h_alpha)),
@@ -253,9 +282,9 @@ namespace OpenOrbitalOptimizer {
     /// the previous default forced; the line search bumps sigma up
     /// adaptively when wrong-sign or near-degenerate DOFs cause the
     /// trial step to overshoot.
-    Tbase initial_level_shift_ = 1e-3;
+    Tbase initial_level_shift_ = Tbase(1e-3);
     /// Level shift diminution factor
-    Tbase level_shift_factor_ = 2.0;
+    Tbase level_shift_factor_ = Tbase(2);
 
     /// Energy gap below which orbitals are treated as degenerate when
     /// enumerating skeleton density matrices in optimal damping. The
@@ -265,9 +294,9 @@ namespace OpenOrbitalOptimizer {
     /// d-shells under PBE + UHF/UKS) and tight enough to leave the
     /// well-separated valence levels of main-group molecules alone.
     /// Override through optimal_damping_degeneracy_threshold(eps).
-    Tbase optimal_damping_degeneracy_threshold_ = 1e-2;
+    Tbase optimal_damping_degeneracy_threshold_ = Tbase(1e-2);
     /// Norm-squared tolerance for deduplicating skeleton occupations
-    Tbase occupation_change_threshold_ = 1e-6;
+    Tbase occupation_change_threshold_ = Tbase(1e-6);
     /// Number of orbital-rotation steps to take after each ODA step (when CG is the
     /// next state at all -- ODA accept with integer occupations still
     /// skips CG and hands directly to DIIS). The orbital-rotation steps relax the
@@ -313,7 +342,7 @@ namespace OpenOrbitalOptimizer {
     size_t last_active_rotation_count_ = 0;
 
     /// Internal holder for computing deltaE
-    Tbase old_energy_ = 0.0;
+    Tbase old_energy_ = Tbase(0);
 
     /// Polak-Ribière conjugate-gradient state retained between
     /// scaled_steepest_descent_step calls so that we can layer CG on
@@ -494,9 +523,52 @@ namespace OpenOrbitalOptimizer {
 
     /// Get a block of the density matrix for the ihist:th entry
     Matrix<Torb> get_density_matrix_block(size_t ihist, size_t iblock) const {
-      const auto orbitals = get_orbital_block(ihist, iblock);
-      const auto occupations = get_orbital_occupation_block(ihist, iblock);
-      return orbitals * occupations.asDiagonal() * orbitals.adjoint();
+      return build_density_block_(
+          get_orbital_block(ihist, iblock),
+          get_orbital_occupation_block(ihist, iblock),
+          maximum_occupation_(iblock));
+    }
+
+    /// Trace of ``A * B``, evaluated as
+    ///   sum_{ij} A(i,j) * B(j,i) = (A .* B.transpose()).sum()
+    /// -- O(N^2) instead of the O(N^3) matmul-then-trace form.
+    /// The real part is returned; callers rely on the trace being
+    /// real (both A and B are Hermitian in every current use site).
+    Tbase tr_of_product_(const Matrix<Torb> & A,
+                         const Matrix<Torb> & B) const {
+      return std::real((A.array() * B.transpose().array()).sum());
+    }
+
+    /// Build a density-matrix block C * diag(n) * C^dagger from the
+    /// natural-orbital / occupation representation, dropping natural
+    /// orbitals with a zero occupation before the outer product. The
+    /// restricted product is O(k * n_basis^2) with ``k`` the number
+    /// of populated natural orbitals, versus O(n_basis^3) for the
+    /// unrestricted form -- worth doing whenever ``k << n_basis``
+    /// (atoms and small molecules, ODA polytope vertices, brute-
+    /// force search trial occupations, ...).
+    Matrix<Torb> build_density_block_(
+        const OrbitalBlock<Torb> & C,
+        const OrbitalBlockOccupations<Tbase> & n,
+        Tbase max_occ) const {
+      const Tbase tol =
+          Tbase(10) * max_occ * std::numeric_limits<Tbase>::epsilon();
+      Index n_active = 0;
+      for(Index k = 0; k < n.size(); k++)
+        if(std::abs(n(k)) > tol) ++n_active;
+      if(n_active == 0)
+        return Matrix<Torb>::Zero(C.rows(), C.rows());
+      Matrix<Torb> C_active(C.rows(), n_active);
+      Vector<Tbase> n_active_vals(n_active);
+      Index col = 0;
+      for(Index k = 0; k < n.size(); k++) {
+        if(std::abs(n(k)) > tol) {
+          C_active.col(col) = C.col(k);
+          n_active_vals(col) = n(k);
+          ++col;
+        }
+      }
+      return C_active * n_active_vals.asDiagonal() * C_active.adjoint();
     }
 
     /// Get a block of the orbital occupations for the ihist:th entry
@@ -641,25 +713,99 @@ namespace OpenOrbitalOptimizer {
       return mat;
     }
 
+    /// Empty every history-derived cache. Called on any operation
+    /// that discards or replaces history entries wholesale
+    /// (initialize_with_*, reset_history).
+    void clear_diis_caches_() const {
+      diis_commutator_cache_.clear();
+      trace_DF_cache_.clear();
+      diis_matrix_cache_.clear();
+      density_diff_cache_.clear();
+    }
+
+    /// Ordered index pair for symmetric caches, so lookups agree
+    /// regardless of the caller's (i, j) ordering.
+    static std::pair<size_t, size_t> sorted_pair_(size_t a, size_t b) {
+      return a <= b ? std::make_pair(a, b) : std::make_pair(b, a);
+    }
+
+    /// AO-basis commutator ``FP - PF`` for a history entry / block,
+    /// lazily built via the rank-k route
+    ///   FP = F * (C_occ * diag(n_occ) * C_occ^dagger)
+    ///   PF = (FP)^dagger      (F, P Hermitian)
+    /// so the build is ``O(k * n_basis^2)`` in place of the naive
+    /// ``O(n_basis^3)`` two-matmul form. Cached by the entry's stable
+    /// iteration index so subsequent DIIS-matrix accesses at the same
+    /// entry cost nothing.
+    const Matrix<Torb> &
+    diis_commutator_cached_(size_t ihist, size_t iblock) const {
+      const size_t idx = get_index(ihist);
+      auto & blocks = diis_commutator_cache_[idx];
+      if(blocks.empty())
+        blocks.resize(number_of_blocks_);
+      if(blocks[iblock].size() != 0)
+        return blocks[iblock];
+
+      auto F = get_fock_matrix_block(ihist, iblock);
+      Matrix<Torb> F_sym = (Tbase(1)/Tbase(2)) * (F + F.adjoint());
+
+      // Extract occupied natural orbitals for the rank-k FP build.
+      const auto C_full = get_orbital_block(ihist, iblock);
+      const auto occ    = get_orbital_occupation_block(ihist, iblock);
+      const Tbase tol   = Tbase(10) * maximum_occupation_(iblock)
+                        * std::numeric_limits<Tbase>::epsilon();
+      Index n_active = 0;
+      for(Index k = 0; k < occ.size(); k++)
+        if(std::abs(occ(k)) > tol) ++n_active;
+      Matrix<Torb> C_active(C_full.rows(), n_active);
+      Vector<Tbase> n_active_vals(n_active);
+      Index col = 0;
+      for(Index k = 0; k < occ.size(); k++)
+        if(std::abs(occ(k)) > tol) {
+          C_active.col(col)  = C_full.col(k);
+          n_active_vals(col) = occ(k);
+          ++col;
+        }
+      if(n_active == 0) {
+        blocks[iblock] = Matrix<Torb>::Zero(F_sym.rows(), F_sym.cols());
+        return blocks[iblock];
+      }
+      Matrix<Torb> FC = F_sym * C_active;                  // O(N^2 * k)
+      Matrix<Torb> FP = FC * n_active_vals.asDiagonal()
+                     * C_active.adjoint();                 // O(N^2 * k)
+      // PF = (FP)^dagger since F and P are Hermitian.
+      blocks[iblock] = FP - FP.adjoint();
+      return blocks[iblock];
+    }
+
+    /// Sum over blocks of ``tr(D_a * F_b)`` for the given history
+    /// entries, cached by (idx_a, idx_b).
+    Tbase trace_DF_cached_(size_t ihist_a, size_t ihist_b) const {
+      const size_t idx_a = get_index(ihist_a);
+      const size_t idx_b = get_index(ihist_b);
+      const auto key = std::make_pair(idx_a, idx_b);
+      auto it = trace_DF_cache_.find(key);
+      if(it != trace_DF_cache_.end()) return it->second;
+      Tbase tr = Tbase(0);
+      for(size_t iblock = 0; iblock < number_of_blocks_; iblock++) {
+        if(empty_block(iblock)) continue;
+        tr += tr_of_product_(
+            get_density_matrix_block(ihist_a, iblock),
+            get_fock_matrix_block(ihist_b, iblock));
+      }
+      trace_DF_cache_[key] = tr;
+      return tr;
+    }
+
     /// Compute DIIS residual
     Matrix<Torb> diis_residual(size_t ihist, size_t iblock) const {
-      // Error is measured by FPS-SPF = FP - PF, since we have a unit metric.
-      auto F = get_fock_matrix_block(ihist, iblock);
-      auto P = get_density_matrix_block(ihist, iblock);
-
-      // Though F and P should be symmetric by construction, explicitly symmetrize
-      // them and compute commutator to avoid symmetry-related numerical issues.
-      Matrix<Torb> F_sym = 0.5 * (F + F.adjoint());
-      Matrix<Torb> P_sym = 0.5 * (P + P.adjoint());
-      Matrix<Torb> PF = P_sym * F_sym;
-      Matrix<Torb> FP = F_sym * P_sym;
-      Matrix<Torb> commutator = PF - FP;
-
-      // To make the L^infty error independent of the underlying basis
-      // set, we project the residual into the best orbitals we have
+      // FPS - SPF (S = I) commutator lives on the cache with the
+      // ``FP - PF`` sign convention. Project into the current
+      // reference natural orbitals so the L^infty norm stays
+      // basis-independent, matching the pre-cache semantics.
+      const Matrix<Torb> & X = diis_commutator_cached_(ihist, iblock);
       auto C = get_orbital_block(0, iblock);
-      commutator = C.adjoint() * commutator * C;
-      return commutator;
+      return C.adjoint() * X * C;
     }
 
     /// Compute DIIS residual
@@ -737,14 +883,25 @@ namespace OpenOrbitalOptimizer {
 
     /// Compute element of DIIS error matrix
     Tbase diis_error_matrix_element(size_t ihist, size_t jhist) const {
-      Tbase el=0.0;
+      // dot(e_i, e_j) = Re(tr((C^dagger X_i C)^dagger (C^dagger X_j C))).
+      // C is unitary (full natural-orbital basis) so this reduces to
+      //   Re(tr(X_i^dagger X_j)) = -Re(tr(X_i X_j))
+      // using the anti-Hermitian property X^dagger = -X. Both factors
+      // and the resulting scalar are cached by the entries' stable
+      // iteration indices; a matrix element only re-touches the
+      // commutator cache when it hasn't been seen before.
+      const auto key = sorted_pair_(get_index(ihist), get_index(jhist));
+      auto it = diis_matrix_cache_.find(key);
+      if(it != diis_matrix_cache_.end()) return it->second;
+      Tbase el=Tbase(0);
       for(size_t iblock=0; iblock<number_of_blocks_; iblock++) {
         if(empty_block(iblock))
           continue;
-        Vector<Tbase> ei(diis_error_vector(ihist, iblock));
-        Vector<Tbase> ej(diis_error_vector(jhist, iblock));
-        el += ei.dot(ej);
+        const Matrix<Torb> & Xi = diis_commutator_cached_(ihist, iblock);
+        const Matrix<Torb> & Xj = diis_commutator_cached_(jhist, iblock);
+        el -= tr_of_product_(Xi, Xj);
       }
+      diis_matrix_cache_[key] = el;
       return el;
     }
 
@@ -797,24 +954,24 @@ namespace OpenOrbitalOptimizer {
 
       // Set up the DIIS error matrix
       const size_t N=history_mask.size();
-      Matrix<Tbase> B = Matrix<Tbase>::Constant(N+1, N+1, Tbase(-1.0));
+      Matrix<Tbase> B = Matrix<Tbase>::Constant(N+1, N+1, Tbase(-Tbase(1)));
       B.block(0, 0, N, N) = diis_error_matrix(history_mask);
-      B(N,N)=0.0;
+      B(N,N)=Tbase(0);
 
       // Apply the diagonal damping
-      B.block(0, 0, N, N).diagonal() *= 1.0+diis_diagonal_damping_;
+      B.block(0, 0, N, N).diagonal() *= Tbase(1)+diis_diagonal_damping_;
 
       // To improve numerical conditioning, scale entries of error
       // matrix such that the last diagonal element is one; Eckert et
       // al, J. Comput. Chem 18. 1473-1483 (1997)
       Vector<Tbase> Bdiag(B.diagonal());
       Tbase diagmin = Bdiag.head(N).minCoeff();
-      if(diagmin != 0.0)
+      if(diagmin != Tbase(0))
         B.block(0, 0, N, N) /= diagmin;
 
       // Right-hand side of equation is
       Vector<Tbase> rh = Vector<Tbase>::Zero(N+1);
-      rh(N)=-1.0;
+      rh(N)=-Tbase(1);
 
       // Solve the equation
       Vector<Tbase> sol = B.colPivHouseholderQr().solve(rh);
@@ -836,11 +993,11 @@ namespace OpenOrbitalOptimizer {
 
       // Parameters
       const size_t max_iter = 1000000;
-      const Tbase df_tol = 1e-8;
+      const Tbase df_tol = Tbase(1e-8);
 
       // Function to evaluate function value
       std::function<Tbase(const Vector<Tbase> & x)> fx = [b, A](const Vector<Tbase> & x) {
-        return Tbase(0.5)*(x.transpose()*A*x).value() + b.dot(x);
+        return Tbase(1)/Tbase(2)*(x.transpose()*A*x).value() + b.dot(x);
       };
 
       // Function to determine optimal step
@@ -852,17 +1009,17 @@ namespace OpenOrbitalOptimizer {
       /// Make initial guesses for parameters
       std::vector<Vector<Tbase>> xguess;
       // Center point
-      xguess.push_back(Vector<Tbase>::Constant(b.size(), Tbase(1.0)/b.size()));
+      xguess.push_back(Vector<Tbase>::Constant(b.size(), Tbase(1)/b.size()));
       // "Gauss" points
       for(Index i=0;i<b.size();i++) {
-        Vector<Tbase> xtr = Vector<Tbase>::Constant(b.size(), Tbase(1.0)/(b.size()+2));
+        Vector<Tbase> xtr = Vector<Tbase>::Constant(b.size(), Tbase(1)/(b.size()+2));
         xtr(i) *= 3;
         xguess.push_back(xtr);
       }
       // End points
       for(Index i=0;i<b.size();i++) {
         Vector<Tbase> xtr = Vector<Tbase>::Zero(b.size());
-        xtr(i) = 1.0;
+        xtr(i) = Tbase(1);
         xguess.push_back(xtr);
       }
 
@@ -893,7 +1050,7 @@ namespace OpenOrbitalOptimizer {
           if(!std::isnormal(step))
             continue;
           //printf("Direction %i: optimal step %e\n",i,step);
-          if(step > 0.0 and step <= 1.0) {
+          if(step > Tbase(0) and step <= Tbase(1)) {
             auto new_point = fx(x+step*(c_i-x));
             //printf("Direction %i: optimal step changes energy by %e\n",(int) i,new_point.first - current_point.first);
             if(new_point < current_point) {
@@ -911,7 +1068,7 @@ namespace OpenOrbitalOptimizer {
 
         // Repeat line search along this direction
         Tbase step = optimal_step(dx, x);
-        if(std::isnormal(step) and step > 0.0 and step <= 1.0) {
+        if(std::isnormal(step) and step > Tbase(0) and step <= Tbase(1)) {
           auto new_point = fx(x+step*dx);
           if(new_point < current_point) {
             x += step*dx;
@@ -954,9 +1111,9 @@ namespace OpenOrbitalOptimizer {
       }
 
       // Handle the edge case where the last matrix has zero norm
-      if(x(0)==0.0) {
+      if(x(0)==Tbase(0)) {
         x.setZero();
-        x(0)=1.0;
+        x(0)=Tbase(1);
         // Reset search directions
         search_directions.setIdentity();
         for(Index i=0; i<b.size(); i++) {
@@ -965,7 +1122,7 @@ namespace OpenOrbitalOptimizer {
           Tbase step = optimal_step(c_i-x, x);
           if(!std::isnormal(step))
             continue;
-          if(step > 0.0 and step < 1.0) {
+          if(step > Tbase(0) and step < Tbase(1)) {
             auto new_point = fx(x+step*(c_i-x));
             if(new_point < current_point) {
               x += step*(c_i-x);
@@ -982,20 +1139,16 @@ namespace OpenOrbitalOptimizer {
       return x;
     }
 
-    /// ADIIS linear term: <D_i - D_0 | F_i - F_0>
+    /// ADIIS linear term: <D_i - D_0 | F_0>
     Vector<Tbase> adiis_linear_term() const {
-      Vector<Tbase> ret = Vector<Tbase>::Zero(orbital_history_.size());
-      for(size_t iblock=0;iblock<number_of_blocks_;iblock++) {
-        if(empty_block(iblock))
-          continue;
-        const auto & Dn = get_density_matrix_block(0, iblock);
-        const auto & Fn = get_fock_matrix_block(0, iblock);
-        for(Index ihist=0;ihist<ret.size();ihist++) {
-          // D_i - D_n
-          Matrix<Torb> dD(get_density_matrix_block(ihist, iblock) - Dn);
-          ret(ihist) += 2.0*std::real((dD*Fn).trace());
-        }
-      }
+      // 2 * (tr(D_i F_0) - tr(D_0 F_0)) per history entry -- both
+      // primitives live in trace_DF_cache_ and are shared with the
+      // ADIIS/EDIIS quadratic-term builders.
+      const size_t nhist = orbital_history_.size();
+      const Tbase tD0_F0 = trace_DF_cached_(0, 0);
+      Vector<Tbase> ret(nhist);
+      for(size_t ihist = 0; ihist < nhist; ihist++)
+        ret(ihist) = Tbase(2) * (trace_DF_cached_(ihist, 0) - tD0_F0);
       return ret;
     }
 
@@ -1008,22 +1161,20 @@ namespace OpenOrbitalOptimizer {
       return ret;
     }
 
-    /// ADIIS quadratic term: <D_i - D_n | F_j - F_n>
+    /// ADIIS quadratic term: <D_i - D_0 | F_j - F_0>
     Matrix<Tbase> adiis_quadratic_term() const {
-      Matrix<Tbase> ret = Matrix<Tbase>::Zero(orbital_history_.size(), orbital_history_.size());
-      for(size_t iblock=0;iblock<number_of_blocks_;iblock++) {
-        if(empty_block(iblock))
-          continue;
-        const auto & Dn = get_density_matrix_block(0, iblock);
-        const auto & Fn = get_fock_matrix_block(0, iblock);
-        for(size_t ihist=0;ihist<orbital_history_.size();ihist++) {
-          for(size_t jhist=0;jhist<orbital_history_.size();jhist++) {
-            // D_i - D_n
-            Matrix<Torb> dD(get_density_matrix_block(ihist, iblock) - Dn);
-            // F_j - F_n
-            Matrix<Torb> dF(get_fock_matrix_block(jhist, iblock) - Fn);
-            ret(ihist,jhist) += std::real((dD*dF).trace());
-          }
+      // Expand: tr((D_i - D_0)(F_j - F_0)) = tr(D_i F_j) - tr(D_i F_0)
+      //                                    - tr(D_0 F_j) + tr(D_0 F_0)
+      // All four primitives are cached via trace_DF_cached_.
+      const size_t nhist = orbital_history_.size();
+      const Tbase tD0_F0 = trace_DF_cached_(0, 0);
+      Matrix<Tbase> ret(nhist, nhist);
+      for(size_t ihist=0; ihist<nhist; ihist++) {
+        const Tbase tDi_F0 = trace_DF_cached_(ihist, 0);
+        for(size_t jhist=0; jhist<nhist; jhist++) {
+          const Tbase tD0_Fj = trace_DF_cached_(0, jhist);
+          ret(ihist, jhist) = trace_DF_cached_(ihist, jhist)
+                            - tDi_F0 - tD0_Fj + tD0_F0;
         }
       }
       // Only the symmetric part matters; we also multiply by two
@@ -1033,23 +1184,24 @@ namespace OpenOrbitalOptimizer {
 
     /// EDIIS quadratic term: -0.5*<D_i - D_j | F_i - F_j>
     Matrix<Tbase> ediis_quadratic_term() const {
-      Matrix<Tbase> ret = Matrix<Tbase>::Zero(orbital_history_.size(), orbital_history_.size());
-      for(size_t iblock=0;iblock<number_of_blocks_;iblock++) {
-        if(empty_block(iblock))
-          continue;
-        for(size_t ihist=0;ihist<orbital_history_.size();ihist++) {
-          for(size_t jhist=0;jhist<orbital_history_.size();jhist++) {
-            // D_i - D_j
-            Matrix<Torb> dD(get_density_matrix_block(ihist, iblock) - get_density_matrix_block(jhist, iblock));
-            // F_i - F_j
-            Matrix<Torb> dF(get_fock_matrix_block(ihist, iblock) - get_fock_matrix_block(jhist, iblock));
-            ret(ihist,jhist) -= std::real((dD*dF).trace());
-          }
+      // Expand: tr((D_i - D_j)(F_i - F_j)) = tr(D_i F_i) - tr(D_i F_j)
+      //                                    - tr(D_j F_i) + tr(D_j F_j)
+      // Every primitive is cached via trace_DF_cached_ and shared
+      // with the ADIIS terms.
+      const size_t nhist = orbital_history_.size();
+      Matrix<Tbase> ret(nhist, nhist);
+      for(size_t ihist=0; ihist<nhist; ihist++) {
+        const Tbase tDi_Fi = trace_DF_cached_(ihist, ihist);
+        for(size_t jhist=0; jhist<nhist; jhist++) {
+          const Tbase tDj_Fj = trace_DF_cached_(jhist, jhist);
+          const Tbase tDi_Fj = trace_DF_cached_(ihist, jhist);
+          const Tbase tDj_Fi = trace_DF_cached_(jhist, ihist);
+          ret(ihist, jhist) = -(tDi_Fi - tDi_Fj - tDj_Fi + tDj_Fj);
         }
       }
       // Only the symmetric part matters; the factor 0.5 already
       // exists in the base model
-      return 0.5*(ret+ret.adjoint());
+      return (Tbase(1)/Tbase(2))*(ret+ret.adjoint());
     }
 
     /// Calculate ADIIS weights
@@ -1067,7 +1219,7 @@ namespace OpenOrbitalOptimizer {
       // Form DIIS and ADIIS weights
       Vector<Tbase> diis_w(diis_weights());
       log_stream_(10) << "DIIS weights: " << diis_w.transpose() << std::endl;
-      if(aediis_coeff == 0.0) {
+      if(aediis_coeff == Tbase(0)) {
         std::string step = "DIIS";
         return std::make_tuple(diis_w,step);
       }
@@ -1098,8 +1250,8 @@ namespace OpenOrbitalOptimizer {
       log_(10, "Max density projection %e with %s weights\n",density_projections(idx),weight_legend[idx].c_str());
 
       Vector<Tbase> aediis_w = candidate_w.col(idx);
-      Vector<Tbase> weights(aediis_coeff * aediis_w + (1.0 - aediis_coeff) * diis_w);
-      if(aediis_coeff == 1.0) {
+      Vector<Tbase> weights(aediis_coeff * aediis_w + (Tbase(1) - aediis_coeff) * diis_w);
+      if(aediis_coeff == Tbase(1)) {
         step = weight_legend[idx];
       } else {
         step = weight_legend[idx] + "+DIIS";
@@ -1130,7 +1282,7 @@ namespace OpenOrbitalOptimizer {
 
     /// Computes the difference between orbital occupations
     Tbase occupation_difference(const OrbitalOccupations<Tbase> & old_occ, const OrbitalOccupations<Tbase> & new_occ) const {
-      Tbase diff = 0.0;
+      Tbase diff = Tbase(0);
       for(size_t iblock = 0; iblock<old_occ.size(); iblock++) {
         if(old_occ[iblock].size()==0)
           continue;
@@ -1251,19 +1403,15 @@ namespace OpenOrbitalOptimizer {
       if(lorb.size() != rorb.size() or lorb.size() != locc.size() or lorb.size() != rocc.size())
         throw std::logic_error("Inconsistent orbitals!\n");
 
-      Tbase ovl=0.0;
+      Tbase ovl=Tbase(0);
       for(size_t iblock=0; iblock<lorb.size(); iblock++) {
         if(lorb[iblock].size()==0)
           continue;
-        // Get orbital coefficients and occupations
-        const auto & lC = lorb[iblock];
-        const auto & lo = locc[iblock];
-        const auto & rC = rorb[iblock];
-        const auto & ro = rocc[iblock];
-        // Compute projection
-        Matrix<Torb> Pl(lC*lo.asDiagonal()*lC.adjoint());
-        Matrix<Torb> Pr(rC*ro.asDiagonal()*rC.adjoint());
-        ovl += std::real((Pl*Pr).trace());
+        Matrix<Torb> Pl = build_density_block_(
+            lorb[iblock], locc[iblock], maximum_occupation_(iblock));
+        Matrix<Torb> Pr = build_density_block_(
+            rorb[iblock], rocc[iblock], maximum_occupation_(iblock));
+        ovl += tr_of_product_(Pl, Pr);
       }
       return ovl;
     }
@@ -1324,7 +1472,7 @@ namespace OpenOrbitalOptimizer {
 
       auto model_value = [&](const Vector<Tbase> & lam) {
         return E_orig + g.dot(lam)
-                      + Tbase(0.5) * (lam.transpose() * H * lam).value();
+                      + Tbase(1)/Tbase(2) * (lam.transpose() * H * lam).value();
       };
 
       // Per-axis -> particle map.
@@ -1534,7 +1682,7 @@ namespace OpenOrbitalOptimizer {
           }
 
           // Total capacity of the degenerate group
-          Tbase maximum_capacity = 0.0;
+          Tbase maximum_capacity = Tbase(0);
           for(size_t iorb=ifill; iorb<jfill; iorb++)
             maximum_capacity += maximum_occupation_(std::get<1>(all_energies[iorb]));
 
@@ -1601,7 +1749,7 @@ namespace OpenOrbitalOptimizer {
                   orbital_index(g.local_block) + g.slot_offset) = fills[k];
               }
               auto match = [this, &iter_occupations](const std::vector<Vector<Tbase>> & list_occ) {
-                Tbase sqdiff=0.0;
+                Tbase sqdiff=Tbase(0);
                 for(size_t iblock=0; iblock<list_occ.size(); iblock++)
                   sqdiff += (list_occ[iblock]-iter_occupations[iblock]).norm();
                 return sqdiff < occupation_change_threshold_;
@@ -1649,7 +1797,7 @@ namespace OpenOrbitalOptimizer {
               }
             }
 
-            num_left = 0.0;
+            num_left = Tbase(0);
           }
 
           ifill = jfill;
@@ -1687,16 +1835,19 @@ namespace OpenOrbitalOptimizer {
             if(empty_block(iblock))
               continue;
 
-            Matrix<Torb> old_dm = reference_orbitals[iblock] * reference_occupations[iblock].asDiagonal() * reference_orbitals[iblock].adjoint();
+            Matrix<Torb> old_dm = build_density_block_(
+                reference_orbitals[iblock], reference_occupations[iblock],
+                maximum_occupation_(iblock));
 
             Vector<Tbase> new_occ = lambda(iparam)*trial_occupations_per_particle[iparticle][0][iblock_particle];
             for(size_t itrial=1; itrial<ntrial; itrial++)
               new_occ += lambda(iparam+itrial)*trial_occupations_per_particle[iparticle][itrial][iblock_particle];
 
-            Matrix<Torb> new_dm = new_orbitals[iblock] * new_occ.asDiagonal() * new_orbitals[iblock].adjoint();
-            Matrix<Torb> mix_dm = (1.0 - lambda_sum)*old_dm + new_dm;
+            Matrix<Torb> new_dm = build_density_block_(
+                new_orbitals[iblock], new_occ, maximum_occupation_(iblock));
+            Matrix<Torb> mix_dm = (Tbase(1) - lambda_sum)*old_dm + new_dm;
 
-            mix_dm *= -1.0;
+            mix_dm *= -Tbase(1);
             Eigen::SelfAdjointEigenSolver<Matrix<Torb>> es(mix_dm);
             interp_occs[iblock] = es.eigenvalues();
             interp_orbs[iblock] = es.eigenvectors();
@@ -1729,19 +1880,42 @@ namespace OpenOrbitalOptimizer {
       };
 
       // Compute tr(fock * (P(dm1) - P(dm2))) where P is built from orbitals * diag(occ) * orbitals^H
-      auto trace_diff = [this](const DensityMatrix<Torb,Tbase> & dm1, const DensityMatrix<Torb,Tbase> & dm2, const FockMatrix<Torb> & fock) {
-        const auto & orbitals1 = dm1.first;
-        const auto & occupations1 = dm1.second;
-        const auto & orbitals2 = dm2.first;
-        const auto & occupations2 = dm2.second;
+      // Materialise a density matrix, per block, from its natural-
+      // orbital / occupation representation. Used to hoist the
+      // C * diag(n) * C^dagger builds out of the O(npars^2) Hessian
+      // loop so each vertex density is constructed once. Delegates
+      // to build_density_block_, which drops zero-occupation natural
+      // orbitals before the outer product.
+      auto materialise_density =
+          [this](const DensityMatrix<Torb,Tbase> & dm) {
+        const auto & orbitals = dm.first;
+        const auto & occupations = dm.second;
+        std::vector<Matrix<Torb>> blocks(orbitals.size());
+        for(size_t iblock=0; iblock<orbitals.size(); iblock++) {
+          if(empty_block(iblock)) continue;
+          blocks[iblock] = build_density_block_(
+              orbitals[iblock], occupations[iblock],
+              maximum_occupation_(iblock));
+        }
+        return blocks;
+      };
 
-        Tbase tr=0.0;
+      // Trace of ``(D_a - D_b) F`` given pre-materialised density
+      // blocks. Uses tr(A F) = sum_{ij} A(i,j) * F(j,i) evaluated as
+      // an element-wise product sum -- O(N^2) instead of the O(N^3)
+      // matmul-then-trace form. Combined with the pre-materialised
+      // density blocks this collapses the axis-Hessian construction
+      // from O(npars^2 * N^3) to O(npars * N^3 + npars^2 * N^2).
+      auto trace_diff = [this](const std::vector<Matrix<Torb>> & D_a,
+                               const std::vector<Matrix<Torb>> & D_b,
+                               const FockMatrix<Torb> & fock) {
+        Tbase tr = Tbase(0);
         for(size_t iblock=0; iblock<fock.size(); iblock++) {
           if(empty_block(iblock))
             continue;
-          Matrix<Torb> dD = orbitals1[iblock] * occupations1[iblock].asDiagonal() * orbitals1[iblock].adjoint()
-                          - orbitals2[iblock] * occupations2[iblock].asDiagonal() * orbitals2[iblock].adjoint();
-          tr += std::real((dD*fock[iblock]).trace());
+          const Matrix<Torb> dD = D_a[iblock] - D_b[iblock];
+          tr += std::real(
+              (dD.array() * fock[iblock].transpose().array()).sum());
         }
         return tr;
       };
@@ -1759,7 +1933,7 @@ namespace OpenOrbitalOptimizer {
       std::vector<DensityMatrix<Torb,Tbase>> axis_densities(npars);
       for(size_t idim=0; idim<npars; idim++) {
         x0.setZero();
-        x0(idim) = 1.0;
+        x0(idim) = Tbase(1);
         axis_densities[idim] = interpolate_density(x0);
       }
       auto axis_fock = evaluate_batch_(axis_densities);
@@ -1782,9 +1956,19 @@ namespace OpenOrbitalOptimizer {
       //   exact when the energy is quadratic in P (Hartree-Fock) and a
       //   second-order finite difference otherwise; symmetrized over (i,j).
       // No additional Fock evaluations beyond the npars axis vertices.
+      //
+      // Materialise D_orig and each D_axis[i] once; the trace-diff
+      // helper then does O(npars^2) elementwise-product traces on
+      // those cached blocks rather than rebuilding a density matrix
+      // per call.
+      const std::vector<Matrix<Torb>> D_orig = materialise_density(P_orig);
+      std::vector<std::vector<Matrix<Torb>>> D_axis(npars);
+      for(size_t i=0; i<npars; i++)
+        D_axis[i] = materialise_density(evaluations[i].first);
+
       Vector<Tbase> grad(npars);
       for(size_t i=0; i<npars; i++)
-        grad(i) = trace_diff(evaluations[i].first, P_orig, F_orig);
+        grad(i) = trace_diff(D_axis[i], D_orig, F_orig);
       Matrix<Tbase> hess(npars, npars);
       for(size_t i=0; i<npars; i++) {
         Tbase E_i = evaluations[i].second.first;
@@ -1792,9 +1976,9 @@ namespace OpenOrbitalOptimizer {
         for(size_t j=i+1; j<npars; j++) {
           const auto & F_j = evaluations[j].second.second;
           const auto & F_i = evaluations[i].second.second;
-          Tbase from_j = trace_diff(evaluations[i].first, P_orig, F_j) - grad(i);
-          Tbase from_i = trace_diff(evaluations[j].first, P_orig, F_i) - grad(j);
-          hess(i, j) = 0.5*(from_j + from_i);
+          Tbase from_j = trace_diff(D_axis[i], D_orig, F_j) - grad(i);
+          Tbase from_i = trace_diff(D_axis[j], D_orig, F_i) - grad(j);
+          hess(i, j) = (Tbase(1)/Tbase(2))*(from_j + from_i);
           hess(j, i) = hess(i, j);
         }
       }
@@ -1820,7 +2004,7 @@ namespace OpenOrbitalOptimizer {
       // groups span several blocks and produce npars in the tens.
       const Tbase eps = std::numeric_limits<Tbase>::epsilon();
       auto model_value = [&](const Vector<Tbase> & lam) {
-        return E_orig + grad.dot(lam) + 0.5*(lam.transpose()*hess*lam).value();
+        return E_orig + grad.dot(lam) + (Tbase(1)/Tbase(2))*(lam.transpose()*hess*lam).value();
       };
       (void) model_value;
       Vector<Tbase> lam_opt;
@@ -1856,7 +2040,7 @@ namespace OpenOrbitalOptimizer {
         Tbase E_i = evaluations[i].second.first;
         Tbase g_i = grad(i);
         Tbase H_ii = hess(i, i);
-        Tbase slope_at_1 = trace_diff(evaluations[i].first, P_orig, evaluations[i].second.second);
+        Tbase slope_at_1 = trace_diff(D_axis[i], D_orig, evaluations[i].second.second);
         auto q = HelperRoutines::fit_quartic_polynomial_with_derivatives<Tbase>(
             E_orig, g_i, H_ii, Tbase(1), E_i, slope_at_1);
         std::array<Tbase, 5> coeffs = {std::get<0>(q), std::get<1>(q), std::get<2>(q),
@@ -1882,14 +2066,12 @@ namespace OpenOrbitalOptimizer {
       // t=0 in that direction is d^T H d = H_ii + H_jj - 2 H_ij.
       for(size_t i=0; i<npars; i++) {
         for(size_t j=i+1; j<npars; j++) {
-          const auto & P_i = evaluations[i].first;
-          const auto & P_j = evaluations[j].first;
           const auto & F_i = evaluations[i].second.second;
           const auto & F_j = evaluations[j].second.second;
           Tbase E_i = evaluations[i].second.first;
           Tbase E_j = evaluations[j].second.first;
-          Tbase slope_i = trace_diff(P_j, P_i, F_i);
-          Tbase slope_j = trace_diff(P_j, P_i, F_j);
+          Tbase slope_i = trace_diff(D_axis[j], D_axis[i], F_i);
+          Tbase slope_j = trace_diff(D_axis[j], D_axis[i], F_j);
           Tbase d2_along_edge = hess(i, i) + hess(j, j) - Tbase(2) * hess(i, j);
           auto q = HelperRoutines::fit_quartic_polynomial_with_derivatives<Tbase>(
               E_i, slope_i, d2_along_edge, Tbase(1), E_j, slope_j);
@@ -2000,7 +2182,7 @@ namespace OpenOrbitalOptimizer {
           Tbase E_at_x = eval_accepted.second.first;
           Vector<Tbase> g_at_x(npars);
           for(size_t i=0; i<npars; i++)
-            g_at_x(i) = trace_diff(evaluations[i].first, P_orig, F_at_x);
+            g_at_x(i) = trace_diff(D_axis[i], D_orig, F_at_x);
           // Re-express the model anchored at x_accepted in the QP's
           // canonical (E_const + g*lambda + 0.5 lambda^T H lambda)
           // form. Expanding the Taylor around x_accepted:
@@ -2008,7 +2190,7 @@ namespace OpenOrbitalOptimizer {
           //             + 0.5 (lambda - x_accepted)^T H (lambda - x_accepted).
           Vector<Tbase> g_eff = g_at_x - hess * x_accepted;
           Tbase E_eff = E_at_x - g_at_x.dot(x_accepted)
-                      + Tbase(0.5) * (x_accepted.transpose() * hess * x_accepted).value();
+                      + Tbase(1)/Tbase(2) * (x_accepted.transpose() * hess * x_accepted).value();
           Vector<Tbase> lam_new;
           Tbase model_min_new;
           std::tie(lam_new, model_min_new) = solve_polytope_qp_(
@@ -2126,7 +2308,7 @@ namespace OpenOrbitalOptimizer {
       for(size_t iblock = 0; iblock < reference_occupations.size(); iblock++) {
         if(empty_block(iblock))
           continue;
-        IndexVector occupied_indices = find_indices_where(reference_occupations[iblock], [](Tbase v){ return v > 0.0; });
+        IndexVector occupied_indices = find_indices_where(reference_occupations[iblock], [](Tbase v){ return v > Tbase(0); });
         for(Index io1 = 0; io1 < occupied_indices.size(); io1++)
           for(Index io2 = 0; io2 < io1; io2++) {
             auto o1 = occupied_indices[io1];
@@ -2141,8 +2323,8 @@ namespace OpenOrbitalOptimizer {
         if(empty_block(iblock))
           continue;
         // Find the occupied and virtual blocks
-        IndexVector occupied_indices = find_indices_where(reference_occupations[iblock], [](Tbase v){ return v > 0.0; });
-        IndexVector virtual_indices = find_indices_where(reference_occupations[iblock], [](Tbase v){ return v == 0.0; });
+        IndexVector occupied_indices = find_indices_where(reference_occupations[iblock], [](Tbase v){ return v > Tbase(0); });
+        IndexVector virtual_indices = find_indices_where(reference_occupations[iblock], [](Tbase v){ return v == Tbase(0); });
         for(Index oi=0; oi<occupied_indices.size(); oi++)
           for(Index vi=0; vi<virtual_indices.size(); vi++)
             dofs.push_back(std::make_tuple(iblock, occupied_indices[oi], virtual_indices[vi]));
@@ -2218,7 +2400,7 @@ namespace OpenOrbitalOptimizer {
     }
 
     /// Formulate the diagonal orbital Hessian
-    Vector<Tbase> precondition_search_direction(const Vector<Tbase> & gradient, const Vector<Tbase> & diagonal_hessian, Tbase shift=0.1) const {
+    Vector<Tbase> precondition_search_direction(const Vector<Tbase> & gradient, const Vector<Tbase> & diagonal_hessian, Tbase shift=Tbase(0.1)) const {
       if(gradient.size() != diagonal_hessian.size())
         throw std::logic_error("precondition_search_direction: gradient and diagonal hessian have different size!\n");
 
@@ -2287,7 +2469,7 @@ namespace OpenOrbitalOptimizer {
             auto iorb = std::get<0>(dof);
             auto jorb = std::get<1>(dof);
             auto idof = std::get<2>(dof);
-            kappa[iblock](iorb,jorb) += Torb(0.0,x(dof_list.size()+idof));
+            kappa[iblock](iorb,jorb) += Torb(Tbase(0),x(dof_list.size()+idof));
           }
         }
         // Antisymmetrize
@@ -2402,9 +2584,9 @@ namespace OpenOrbitalOptimizer {
             continue;
           Vector<Tbase> fractional_occupations(get_orbital_occupation_block(0, iblock)/maximum_occupation_(iblock));
           fractional_occupations = Vector<Tbase>::Ones(fractional_occupations.size()) - fractional_occupations;
-          Matrix<Torb> orbitals(get_orbital_block(0, iblock));
-
-          shifted_fock[iblock] += level_shift *(orbitals * fractional_occupations.asDiagonal() * orbitals.adjoint());
+          shifted_fock[iblock] += level_shift * build_density_block_(
+              get_orbital_block(0, iblock), fractional_occupations,
+              maximum_occupation_(iblock));
         }
 
         // Add new Fock matrix
@@ -2576,7 +2758,7 @@ namespace OpenOrbitalOptimizer {
         Matrix<std::complex<Tbase>> KI = K[b].template cast<std::complex<Tbase>>() * std::complex<Tbase>(Tbase{0}, Tbase{-1});
         // Hermitize to suppress eig_sym roundoff warnings; -iK is
         // analytically Hermitian for anti-Hermitian K.
-        KI = std::complex<Tbase>(Tbase{0.5}) * (KI + KI.adjoint().eval());
+        KI = std::complex<Tbase>(Tbase{(Tbase(1)/Tbase(2))}) * (KI + KI.adjoint().eval());
         Eigen::SelfAdjointEigenSolver<Matrix<std::complex<Tbase>>> es(KI);
         Vector<Tbase> ev = es.eigenvalues();
         if(ev.size() > 0) {
@@ -2743,7 +2925,7 @@ namespace OpenOrbitalOptimizer {
 
           // Predict next t from the cubic Hermite fit on [0, t] with
           // E(0) = E_ref, E'(0) = slope_0, E(t) = E_t, E'(t) = slope_t.
-          Tbase t_next = t * Tbase(0.5);
+          Tbase t_next = t * Tbase(1)/Tbase(2);
           try {
             auto cubic = HelperRoutines::fit_cubic_polynomial_with_derivatives<Tbase>(
                 ctx.E_ref, slope_0, t, E_t, slope_t);
@@ -2765,7 +2947,7 @@ namespace OpenOrbitalOptimizer {
             // Cubic derivative has no real roots; fall through to halving.
           }
           if(t_next < t_floor) t_next = t_floor;
-          if(t_next >= t)      t_next = t * Tbase(0.5);  // ensure progress
+          if(t_next >= t)      t_next = t * Tbase(1)/Tbase(2);  // ensure progress
           t = t_next;
         }
         if(success) break;
@@ -3103,7 +3285,7 @@ namespace OpenOrbitalOptimizer {
           // Enforce exact Hermiticity to silence eig_sym roundoff
           // warnings; the unsymmetric residual is O(eps) for an
           // analytically Hermitian operator.
-          F_sub = Tbase(0.5) * (F_sub + F_sub.adjoint().eval());
+          F_sub = Tbase(1)/Tbase(2) * (F_sub + F_sub.adjoint().eval());
           Eigen::SelfAdjointEigenSolver<Matrix<Torb>> es(F_sub);
           Vector<Tbase> eps_sub = es.eigenvalues();
           Matrix<Torb> U_sub = es.eigenvectors();
@@ -3238,6 +3420,7 @@ namespace OpenOrbitalOptimizer {
       if(orbitals.size() != number_of_blocks_)
         throw std::logic_error("Fed in orbitals and orbital occupations do not have the required number of blocks!\n");
       orbital_history_.clear();
+      clear_diis_caches_();
 
       // Reset number of evaluations
       number_of_fock_evaluations_ = 0;
@@ -3270,6 +3453,7 @@ namespace OpenOrbitalOptimizer {
 
         // Clear out the old history
         orbital_history_.clear();
+      clear_diis_caches_();
         // and add the new entry
         add_entry(std::make_pair(new_orbitals.first, new_occupations));
       }
@@ -3549,13 +3733,20 @@ namespace OpenOrbitalOptimizer {
 
 
     /// Density matrix difference norm
-    Tbase density_matrix_difference(size_t ihist, size_t jhist) {
-      Tbase diff_norm = 0.0;
+    Tbase density_matrix_difference(size_t ihist, size_t jhist) const {
+      // Symmetric in (ihist, jhist); cache by ordered (idx_i, idx_j)
+      // so a persistent history entry pair reuses its previous value
+      // across SCF iterations.
+      const auto key = sorted_pair_(get_index(ihist), get_index(jhist));
+      auto it = density_diff_cache_.find(key);
+      if(it != density_diff_cache_.end()) return it->second;
+      Tbase diff_norm = Tbase(0);
       for(size_t iblock=0;iblock<number_of_blocks_;iblock++) {
         if(empty_block(iblock))
           continue;
         diff_norm += norm(vectorise(Matrix<Torb>(get_density_matrix_block(ihist, iblock)-get_density_matrix_block(jhist, iblock))));
       }
+      density_diff_cache_[key] = diff_norm;
       return diff_norm;
     }
 
@@ -3567,7 +3758,7 @@ namespace OpenOrbitalOptimizer {
         // rms isn't implemented in Armadillo for some reason
         if(mat.size() == 0)
           return 0;
-        return mat.norm()/std::sqrt(1.0*mat.size());
+        return mat.norm()/std::sqrt(Tbase(1)*mat.size());
       } else if(norm == "inf") {
         return mat.template lpNorm<Eigen::Infinity>();
       } else if(norm == "fro") {
@@ -3588,7 +3779,7 @@ namespace OpenOrbitalOptimizer {
       number_of_fock_evaluations_++;
 
       if(verbosity_>=5) {
-        auto reference_energy = orbital_history_.size()>0 ? get_energy() : 0.0;
+        auto reference_energy = orbital_history_.size()>0 ? get_energy() : Tbase(0);
         log_(5, "Evaluated energy % .10f (change from lowest %e)\n", fock.first, fock.first-reference_energy);
       }
       return add_entry(density, fock);
@@ -3658,6 +3849,7 @@ namespace OpenOrbitalOptimizer {
     void reset_history() {
       while(orbital_history_.size()>1)
         orbital_history_.pop_back();
+      clear_diis_caches_();
     }
 
     /// Computes orbitals and orbital energies by diagonalizing the Fock matrix
@@ -3672,7 +3864,7 @@ namespace OpenOrbitalOptimizer {
         if(fock[iblock].size()==0)
           continue;
         // Symmetrize Fock matrix
-        Matrix<Torb> fsymm(0.5*(fock[iblock]+fock[iblock].adjoint()));
+        Matrix<Torb> fsymm((Tbase(1)/Tbase(2))*(fock[iblock]+fock[iblock].adjoint()));
         Eigen::SelfAdjointEigenSolver<Matrix<Torb>> es(fsymm);
         diagonalized_fock.second[iblock] = es.eigenvalues();
         diagonalized_fock.first[iblock] = es.eigenvectors();
@@ -3859,7 +4051,7 @@ namespace OpenOrbitalOptimizer {
         return fallback;
       };
 
-      old_energy_ = 0.0;
+      old_energy_ = Tbase(0);
       int failed_iterations = 0;
       // Number of orbital-rotation steps still owed by the current ODA -> orbital-rotation burst,
       // budgeted by orbital_rotation_steps_after_oda_ at the ODA transition.
@@ -4145,11 +4337,11 @@ namespace OpenOrbitalOptimizer {
           // DIIS step. Compute mixing factor (Garza and Scuseria, 2012).
           Tbase aediis_coeff;
           if(diis_error < diis_threshold_) {
-            aediis_coeff = 0.0;
+            aediis_coeff = Tbase(0);
           } else if(diis_error < diis_epsilon_) {
             aediis_coeff = (diis_error-diis_threshold_)/(diis_epsilon_-diis_threshold_);
           } else {
-            aediis_coeff = 1.0;
+            aediis_coeff = Tbase(1);
           }
           Vector<Tbase> weights;
           std::string step;
@@ -4295,7 +4487,7 @@ namespace OpenOrbitalOptimizer {
                 trial_number(iblock_source) -= i_moved;
                 trial_number(iblock_target) += i_moved;
 
-                if(trial_number(iblock_source) < 0.0 or trial_number(iblock_target) > i_target_capacity)
+                if(trial_number(iblock_source) < Tbase(0) or trial_number(iblock_target) > i_target_capacity)
                   continue;
 
                 fixed_number_of_particles_per_block_ = trial_number;
@@ -4381,7 +4573,7 @@ namespace OpenOrbitalOptimizer {
                         trial_number(jblock_source) -= j_moved;
                         trial_number(jblock_target) += j_moved;
 
-                        if(trial_number(iblock_source) < 0.0 or trial_number(jblock_source) < 0.0)
+                        if(trial_number(iblock_source) < Tbase(0) or trial_number(jblock_source) < Tbase(0))
                           continue;
                         if(trial_number(iblock_target) > i_target_capacity)
                           continue;

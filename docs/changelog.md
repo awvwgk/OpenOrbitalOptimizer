@@ -18,6 +18,71 @@
 ## v0.5.0 / (Unreleased)
 
 #### Enhancements
+* Speed up the ODA quadratic-model construction and the whole
+  DIIS / ADIIS / EDIIS extrapolation stack via a coordinated
+  refactor of the ``C * diag(n) * C^dagger`` and
+  ``(A * B).trace()`` idioms scattered through ``scfsolver.hpp``.
+    - New ``build_density_block_`` is the single density-matrix
+      construction path. Extracts the occupied natural orbitals
+      first, so the outer product is O(k * n_basis^2) instead of
+      the naive O(n_basis^3). Now used by ``get_density_matrix_block``
+      (so every DIIS-side caller benefits), the ODA polytope-vertex
+      cache, ``density_overlap``, the level-shift block, and
+      ``interpolate_density``.
+    - New ``tr_of_product_`` computes ``tr(A * B)`` in O(n_basis^2)
+      via ``(A * B.transpose()).sum()`` instead of the O(n_basis^3)
+      matmul-then-trace form. Replaces every ``(A * B).trace()``
+      call in the file: ADIIS linear + quadratic, EDIIS quadratic,
+      ``density_overlap``, and the ODA gradient / Hessian
+      ``trace_diff``.
+    - ``adiis_quadratic_term`` and ``ediis_quadratic_term`` now
+      pre-cache the block densities so the doubly-nested history
+      loop no longer re-materialises the same density
+      ``nhist`` times.
+    - ``optimal_damping_step`` pre-caches each axis-vertex density
+      once via ``materialise_density``; the trace-diff loop then
+      does one O(n_basis^2) elementwise trace per call rather than
+      an O(n_basis^3) matmul that started from raw ``(C, n)``.
+      Total polytope-setup cost drops from ``O(npars^2 * n_basis^3)``
+      to ``O(npars * k * n_basis^2 + npars^2 * n_basis^2)`` -- a
+      ~20x-30x speed-up already at ``npars = 28`` and increasing
+      with basis size, which unlocks useful ODA behaviour on
+      heavy-atom / large-basis systems where the older
+      implementation appeared to hang after "Roothaan step in
+      dimension N".
+* Cache DIIS / ADIIS / EDIIS primitives across SCF iterations. Two
+  mutable caches keyed on each history entry's stable iteration
+  index:
+    - ``diis_commutator_cache_`` holds the AO-basis commutator
+      ``FP - PF`` per entry per block. Built via the rank-k route
+      ``FP = F * (C_occ * diag(n_occ) * C_occ^dagger)`` in
+      O(k * n_basis^2), with ``PF = (FP)^dagger`` skipping the
+      second full matmul entirely. Dot products of AO-basis
+      commutators are unitary-invariant, so the same cache backs
+      both ``diis_error_matrix_element`` (no projection) and the
+      per-iteration ``diis_residual`` used by ``converged()``.
+    - ``trace_DF_cache_`` holds sum-over-blocks ``tr(D_a * F_b)``
+      for every entry pair. Every ADIIS / EDIIS linear or
+      quadratic entry is one of at most four such primitives, so
+      the whole extrapolation-matrix build reduces to map lookups
+      once the primitives are populated.
+    - ``diis_matrix_cache_`` holds the final DIIS error-matrix
+      element ``B(i, j) = -Re(tr(X_i * X_j))`` summed over blocks,
+      keyed by the sorted pair of iteration indices. Once cached,
+      each subsequent ``B(i, j)`` access is one map lookup with no
+      per-block work at all -- the doubly-nested DIIS matrix loop
+      only ever visits the row / column of the newest entry.
+    - ``density_diff_cache_`` holds the sum-over-blocks Frobenius
+      distance ``||D_i - D_j||`` from ``density_matrix_difference``,
+      keyed the same way so the ``cleanup()`` sweep runs at
+      steady-state cost.
+    - Caches are cleared by ``initialize_with_*`` and
+      ``reset_history()``. Stale entries otherwise linger, which
+      is cheap: one ``Tbase`` per scalar cache and O(n_basis^2)
+      per commutator block.
+    Per-iteration cost of the DIIS matrix build drops from
+    O(nhist^2 * n_basis^3) naive to O(n_basis^2) steady-state
+    (only the new entry's row / column populates).
 * ODA trust-region refinement: after each ``optimal_damping_step``
   accepts a trial candidate, re-anchor the polytope quadratic
   model at the accepted iterate using the gradient observed there
@@ -134,6 +199,22 @@
   longer permanently silences and thaws the parent solver.
 * Removed the deprecated `run_optimal_damping()` alias on the
   Armadillo compatibility shim.
+
+#### Bug Fixes
+* Corrected the ADIIS linear-term docstring: the loop actually
+  computes ``2 * <D_i - D_0 | F_0>`` (the standard ADIIS model of
+  Hu & Yang, JCP 132, 054109), not ``2 * <D_i - D_0 | F_i - F_0>``
+  as the old comment claimed. Computation itself is unchanged.
+
+#### Misc.
+* Bare ``double`` literals in ``scfsolver.hpp`` arithmetic sites
+  (0.0, 1.0, 2.0, 10.0, 100.0, -1.0; 45 occurrences) wrapped in
+  ``Tbase(N)``, so ``float`` and ``__float128`` instantiations no
+  longer silently promote through ``double``. Bare 0.5 sites
+  rewritten as ``Tbase(1)/Tbase(2)`` (7 occurrences), and
+  scientific-notation / bare decimal defaults such as
+  ``1e-4`` / ``0.02`` wrapped in ``Tbase(...)`` (13 sites) for the
+  same reason.
 
 
 ## v0.4.0 / 2026-07-20
