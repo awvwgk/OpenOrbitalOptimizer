@@ -126,12 +126,12 @@ namespace OpenOrbitalOptimizer {
           T lo = x_prev, hi = x_cur;
           T ylo = y_prev, yhi = y_cur;
           for (int j = 0; j < 60; j++) {
-            T mid = T(0.5) * (lo + hi);
+            T mid = (T(1)/T(2)) * (lo + hi);
             T ymid = f(mid);
             if ((ymid >= T(0)) == (ylo >= T(0))) { lo = mid; ylo = ymid; }
             else                                 { hi = mid; yhi = ymid; }
           }
-          roots.push_back(T(0.5) * (lo + hi));
+          roots.push_back((T(1)/T(2)) * (lo + hi));
         }
         x_prev = x_cur;
         y_prev = y_cur;
@@ -197,25 +197,25 @@ namespace OpenOrbitalOptimizer {
     /// Maximum number of iterations
     size_t maximum_iterations_ = 128;
     /// Start to mix in DIIS at this error threshold (Garza and Scuseria, 2012)
-    Tbase diis_epsilon_ = 1e-1;
+    Tbase diis_epsilon_ = Tbase(1e-1);
     /// Threshold for pure DIIS (Garza and Scuseria, 2012)
-    Tbase diis_threshold_ = 1e-4;
+    Tbase diis_threshold_ = Tbase(1e-4);
     /// Damping factor for DIIS diagonal (Hamilton and Pulay, 1986)
-    Tbase diis_diagonal_damping_ = 0.02;
+    Tbase diis_diagonal_damping_ = Tbase(0.02);
     /// DIIS restart criterion (Chupin et al, 2021)
-    Tbase diis_restart_factor_ = 1e-4;
+    Tbase diis_restart_factor_ = Tbase(1e-4);
 
     /// Criterion for max error for which to use optimal damping
     Tbase optimal_damping_threshold_ = Tbase(1);
 
     /// History cleanup criterion: keep only those density matrices that satisfy delta ||P0-Pi|| < min_{j>0} ||P0-Pj||
-    Tbase density_restart_factor_ = 1e-4;
+    Tbase density_restart_factor_ = Tbase(1e-4);
     /// History length
     int maximum_history_length_ = 10;
     /// Steps with no DIIS energy improvement after which to use ODA. Previously maximum_history_length_/2
     int oda_restart_steps_ = 5;
     /// Convergence threshold for orbital gradient
-    Tbase convergence_threshold_ = 1e-7;
+    Tbase convergence_threshold_ = Tbase(1e-7);
     /// Safety factor K for the arithmetic-precision clamp on the
     /// effective convergence threshold: the SCF is considered
     /// converged when the DIIS error drops below
@@ -240,9 +240,9 @@ namespace OpenOrbitalOptimizer {
     std::string methods_ = "DIIS + ODA + CG";
 
     /// Minimal normalized projection of preconditioned search direction onto gradient
-    Tbase minimal_gradient_projection_ = 1e-4;
+    Tbase minimal_gradient_projection_ = Tbase(1e-4);
     /// Threshold for detection of occupied orbitals
-    Tbase occupied_threshold_ = 1e-6;
+    Tbase occupied_threshold_ = Tbase(1e-6);
     /// Initial level shift used as the floor in the orbital-rotation
     /// preconditioner:
     ///     d_alpha = -g_alpha / (sigma + max(0, h_alpha)),
@@ -253,7 +253,7 @@ namespace OpenOrbitalOptimizer {
     /// the previous default forced; the line search bumps sigma up
     /// adaptively when wrong-sign or near-degenerate DOFs cause the
     /// trial step to overshoot.
-    Tbase initial_level_shift_ = 1e-3;
+    Tbase initial_level_shift_ = Tbase(1e-3);
     /// Level shift diminution factor
     Tbase level_shift_factor_ = Tbase(2);
 
@@ -265,9 +265,9 @@ namespace OpenOrbitalOptimizer {
     /// d-shells under PBE + UHF/UKS) and tight enough to leave the
     /// well-separated valence levels of main-group molecules alone.
     /// Override through optimal_damping_degeneracy_threshold(eps).
-    Tbase optimal_damping_degeneracy_threshold_ = 1e-2;
+    Tbase optimal_damping_degeneracy_threshold_ = Tbase(1e-2);
     /// Norm-squared tolerance for deduplicating skeleton occupations
-    Tbase occupation_change_threshold_ = 1e-6;
+    Tbase occupation_change_threshold_ = Tbase(1e-6);
     /// Number of orbital-rotation steps to take after each ODA step (when CG is the
     /// next state at all -- ODA accept with integer occupations still
     /// skips CG and hands directly to DIIS). The orbital-rotation steps relax the
@@ -879,7 +879,7 @@ namespace OpenOrbitalOptimizer {
 
       // Parameters
       const size_t max_iter = 1000000;
-      const Tbase df_tol = 1e-8;
+      const Tbase df_tol = Tbase(1e-8);
 
       // Function to evaluate function value
       std::function<Tbase(const Vector<Tbase> & x)> fx = [b, A](const Vector<Tbase> & x) {
@@ -1100,7 +1100,7 @@ namespace OpenOrbitalOptimizer {
       }
       // Only the symmetric part matters; the factor 0.5 already
       // exists in the base model
-      return 0.5*(ret+ret.adjoint());
+      return (Tbase(1)/Tbase(2))*(ret+ret.adjoint());
     }
 
     /// Calculate ADIIS weights
@@ -1877,7 +1877,7 @@ namespace OpenOrbitalOptimizer {
           const auto & F_i = evaluations[i].second.second;
           Tbase from_j = trace_diff(D_axis[i], D_orig, F_j) - grad(i);
           Tbase from_i = trace_diff(D_axis[j], D_orig, F_i) - grad(j);
-          hess(i, j) = 0.5*(from_j + from_i);
+          hess(i, j) = (Tbase(1)/Tbase(2))*(from_j + from_i);
           hess(j, i) = hess(i, j);
         }
       }
@@ -1903,7 +1903,7 @@ namespace OpenOrbitalOptimizer {
       // groups span several blocks and produce npars in the tens.
       const Tbase eps = std::numeric_limits<Tbase>::epsilon();
       auto model_value = [&](const Vector<Tbase> & lam) {
-        return E_orig + grad.dot(lam) + 0.5*(lam.transpose()*hess*lam).value();
+        return E_orig + grad.dot(lam) + (Tbase(1)/Tbase(2))*(lam.transpose()*hess*lam).value();
       };
       (void) model_value;
       Vector<Tbase> lam_opt;
@@ -2299,7 +2299,7 @@ namespace OpenOrbitalOptimizer {
     }
 
     /// Formulate the diagonal orbital Hessian
-    Vector<Tbase> precondition_search_direction(const Vector<Tbase> & gradient, const Vector<Tbase> & diagonal_hessian, Tbase shift=0.1) const {
+    Vector<Tbase> precondition_search_direction(const Vector<Tbase> & gradient, const Vector<Tbase> & diagonal_hessian, Tbase shift=Tbase(0.1)) const {
       if(gradient.size() != diagonal_hessian.size())
         throw std::logic_error("precondition_search_direction: gradient and diagonal hessian have different size!\n");
 
@@ -2657,7 +2657,7 @@ namespace OpenOrbitalOptimizer {
         Matrix<std::complex<Tbase>> KI = K[b].template cast<std::complex<Tbase>>() * std::complex<Tbase>(Tbase{0}, Tbase{-1});
         // Hermitize to suppress eig_sym roundoff warnings; -iK is
         // analytically Hermitian for anti-Hermitian K.
-        KI = std::complex<Tbase>(Tbase{0.5}) * (KI + KI.adjoint().eval());
+        KI = std::complex<Tbase>(Tbase{(Tbase(1)/Tbase(2))}) * (KI + KI.adjoint().eval());
         Eigen::SelfAdjointEigenSolver<Matrix<std::complex<Tbase>>> es(KI);
         Vector<Tbase> ev = es.eigenvalues();
         if(ev.size() > 0) {
@@ -3753,7 +3753,7 @@ namespace OpenOrbitalOptimizer {
         if(fock[iblock].size()==0)
           continue;
         // Symmetrize Fock matrix
-        Matrix<Torb> fsymm(0.5*(fock[iblock]+fock[iblock].adjoint()));
+        Matrix<Torb> fsymm((Tbase(1)/Tbase(2))*(fock[iblock]+fock[iblock].adjoint()));
         Eigen::SelfAdjointEigenSolver<Matrix<Torb>> es(fsymm);
         diagonalized_fock.second[iblock] = es.eigenvalues();
         diagonalized_fock.first[iblock] = es.eigenvectors();
