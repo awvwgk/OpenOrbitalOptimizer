@@ -66,10 +66,20 @@
       quadratic entry is one of at most four such primitives, so
       the whole extrapolation-matrix build reduces to map lookups
       once the primitives are populated.
+    - ``diis_matrix_cache_`` holds the final DIIS error-matrix
+      element ``B(i, j) = -Re(tr(X_i * X_j))`` summed over blocks,
+      keyed by the sorted pair of iteration indices. Once cached,
+      each subsequent ``B(i, j)`` access is one map lookup with no
+      per-block work at all -- the doubly-nested DIIS matrix loop
+      only ever visits the row / column of the newest entry.
+    - ``density_diff_cache_`` holds the sum-over-blocks Frobenius
+      distance ``||D_i - D_j||`` from ``density_matrix_difference``,
+      keyed the same way so the ``cleanup()`` sweep runs at
+      steady-state cost.
     - Caches are cleared by ``initialize_with_*`` and
       ``reset_history()``. Stale entries otherwise linger, which
-      is cheap: one ``Tbase`` per ``tr(D_a * F_b)`` primitive and
-      O(n_basis^2) per commutator block.
+      is cheap: one ``Tbase`` per scalar cache and O(n_basis^2)
+      per commutator block.
     Per-iteration cost of the DIIS matrix build drops from
     O(nhist^2 * n_basis^3) naive to O(n_basis^2) steady-state
     (only the new entry's row / column populates).

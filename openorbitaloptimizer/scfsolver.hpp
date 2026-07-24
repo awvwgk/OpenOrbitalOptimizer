@@ -209,6 +209,16 @@ namespace OpenOrbitalOptimizer {
     /// rebuild of the linear/quadratic-term matrices into ``O(nhist)``
     /// new fills per iteration.
     mutable std::map<std::pair<size_t, size_t>, Tbase> trace_DF_cache_;
+    /// Cache: DIIS error matrix element ``dot(e_i, e_j) = -Re(tr(X_i X_j))``,
+    /// keyed by the two entries' stable iteration indices in
+    /// ``(min, max)`` order (the matrix is symmetric).
+    mutable std::map<std::pair<size_t, size_t>, Tbase> diis_matrix_cache_;
+    /// Cache: sum-over-blocks Frobenius-norm-vectorised distance
+    /// between the density matrices of two history entries, keyed by
+    /// their stable iteration indices in ``(min, max)`` order (also
+    /// symmetric). Populated on demand by
+    /// ``density_matrix_difference``.
+    mutable std::map<std::pair<size_t, size_t>, Tbase> density_diff_cache_;
 
     /// Number of Fock matrix evaluations
     size_t number_of_fock_evaluations_ = 0;
@@ -703,11 +713,20 @@ namespace OpenOrbitalOptimizer {
       return mat;
     }
 
-    /// Empty the DIIS caches. Called on any operation that invalidates
-    /// history entries (initialize_with_*, reset_history).
+    /// Empty every history-derived cache. Called on any operation
+    /// that discards or replaces history entries wholesale
+    /// (initialize_with_*, reset_history).
     void clear_diis_caches_() const {
       diis_commutator_cache_.clear();
       trace_DF_cache_.clear();
+      diis_matrix_cache_.clear();
+      density_diff_cache_.clear();
+    }
+
+    /// Ordered index pair for symmetric caches, so lookups agree
+    /// regardless of the caller's (i, j) ordering.
+    static std::pair<size_t, size_t> sorted_pair_(size_t a, size_t b) {
+      return a <= b ? std::make_pair(a, b) : std::make_pair(b, a);
     }
 
     /// AO-basis commutator ``FP - PF`` for a history entry / block,
@@ -867,10 +886,13 @@ namespace OpenOrbitalOptimizer {
       // dot(e_i, e_j) = Re(tr((C^dagger X_i C)^dagger (C^dagger X_j C))).
       // C is unitary (full natural-orbital basis) so this reduces to
       //   Re(tr(X_i^dagger X_j)) = -Re(tr(X_i X_j))
-      // using the anti-Hermitian property X^dagger = -X. That last
-      // form goes straight through the cache -- no per-call
-      // projection into the current reference orbitals -- and picks
-      // up the O(nhist^2) reuse over an SCF run.
+      // using the anti-Hermitian property X^dagger = -X. Both factors
+      // and the resulting scalar are cached by the entries' stable
+      // iteration indices; a matrix element only re-touches the
+      // commutator cache when it hasn't been seen before.
+      const auto key = sorted_pair_(get_index(ihist), get_index(jhist));
+      auto it = diis_matrix_cache_.find(key);
+      if(it != diis_matrix_cache_.end()) return it->second;
       Tbase el=Tbase(0);
       for(size_t iblock=0; iblock<number_of_blocks_; iblock++) {
         if(empty_block(iblock))
@@ -879,6 +901,7 @@ namespace OpenOrbitalOptimizer {
         const Matrix<Torb> & Xj = diis_commutator_cached_(jhist, iblock);
         el -= tr_of_product_(Xi, Xj);
       }
+      diis_matrix_cache_[key] = el;
       return el;
     }
 
@@ -3710,13 +3733,20 @@ namespace OpenOrbitalOptimizer {
 
 
     /// Density matrix difference norm
-    Tbase density_matrix_difference(size_t ihist, size_t jhist) {
+    Tbase density_matrix_difference(size_t ihist, size_t jhist) const {
+      // Symmetric in (ihist, jhist); cache by ordered (idx_i, idx_j)
+      // so a persistent history entry pair reuses its previous value
+      // across SCF iterations.
+      const auto key = sorted_pair_(get_index(ihist), get_index(jhist));
+      auto it = density_diff_cache_.find(key);
+      if(it != density_diff_cache_.end()) return it->second;
       Tbase diff_norm = Tbase(0);
       for(size_t iblock=0;iblock<number_of_blocks_;iblock++) {
         if(empty_block(iblock))
           continue;
         diff_norm += norm(vectorise(Matrix<Torb>(get_density_matrix_block(ihist, iblock)-get_density_matrix_block(jhist, iblock))));
       }
+      density_diff_cache_[key] = diff_norm;
       return diff_norm;
     }
 
