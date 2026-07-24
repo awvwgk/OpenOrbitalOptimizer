@@ -18,6 +18,30 @@
 ## v0.5.0 / (Unreleased)
 
 #### Enhancements
+* ODA now tries a "collapsed" polytope first: when the full
+  skeleton enumeration would exceed ``n_particle_types``, each
+  particle's skeleton set is replaced by its arithmetic mean --
+  one smudged skeleton per particle, one lambda per particle.
+  ``npars`` drops from the pathological "high-symmetry guess"
+  case (e.g. 28 dimensions in the trace that motivated it) down
+  to a handful, cutting vertex evaluations by an order of
+  magnitude. If the collapsed pass fails to descend, the full
+  skeleton set retries transparently -- trust-region refits and
+  everything else apply only to the fallback path. Extra benefit:
+  the smudged density has support in every degenerate orbital, so
+  the SCF can't collapse onto a symmetry-broken saddle from the
+  first-iteration guess.
+* Convergence-time full-polytope check. Every iteration where
+  ``converged() == true`` and ODA is allowed, ``run()`` invokes
+  ``optimal_damping_step(force_full=true)`` before breaking the
+  SCF loop. That confirms the converged iterate is stationary in
+  the full skeleton set and not just in the collapsed one; each
+  accepted step strictly lowers the energy, so the sequence of
+  such checks is finite -- no book-keeping across iterations.
+  After a successful descent the state machine picks the same
+  ``{OrbitalRotation, DIIS, ODA}`` preference the normal post-ODA
+  transition uses, so the next step relaxes at the new
+  occupations before revisiting DIIS.
 * Speed up the ODA quadratic-model construction and the whole
   DIIS / ADIIS / EDIIS extrapolation stack via a coordinated
   refactor of the ``C * diag(n) * C^dagger`` and
