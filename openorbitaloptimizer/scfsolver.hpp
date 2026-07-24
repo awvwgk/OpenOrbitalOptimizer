@@ -1729,19 +1729,70 @@ namespace OpenOrbitalOptimizer {
       };
 
       // Compute tr(fock * (P(dm1) - P(dm2))) where P is built from orbitals * diag(occ) * orbitals^H
-      auto trace_diff = [this](const DensityMatrix<Torb,Tbase> & dm1, const DensityMatrix<Torb,Tbase> & dm2, const FockMatrix<Torb> & fock) {
-        const auto & orbitals1 = dm1.first;
-        const auto & occupations1 = dm1.second;
-        const auto & orbitals2 = dm2.first;
-        const auto & occupations2 = dm2.second;
+      // Materialise a density matrix, per block, from its natural-
+      // orbital / occupation representation. Used to hoist the
+      // C * diag(n) * C^dagger builds out of the O(npars^2) Hessian
+      // loop so each vertex density is constructed once.
+      //
+      // Exploits occupation sparsity: only natural orbitals with a
+      // non-zero occupation contribute to the density matrix, so
+      // the outer product is restricted to the occupied columns
+      // (dropping ~all-zero eigen columns from the polytope-vertex
+      // decomposition). That turns the O(n_basis^3) naive
+      // ``C * diag(n) * C^dagger`` into O(k * n_basis^2) where k
+      // is the number of populated natural orbitals -- often a
+      // handful for atoms and small molecules even when n_basis is
+      // in the hundreds.
+      auto materialise_density =
+          [this](const DensityMatrix<Torb,Tbase> & dm) {
+        const auto & orbitals = dm.first;
+        const auto & occupations = dm.second;
+        std::vector<Matrix<Torb>> blocks(orbitals.size());
+        for(size_t iblock=0; iblock<orbitals.size(); iblock++) {
+          if(empty_block(iblock)) continue;
+          const auto & C_full = orbitals[iblock];
+          const auto & n_full = occupations[iblock];
+          const Tbase tol =
+              Tbase(10) * maximum_occupation_(iblock)
+              * std::numeric_limits<Tbase>::epsilon();
+          Index n_active = 0;
+          for(Index k = 0; k < n_full.size(); k++)
+            if(std::abs(n_full(k)) > tol) ++n_active;
+          if(n_active == 0) {
+            blocks[iblock] = Matrix<Torb>::Zero(C_full.rows(), C_full.rows());
+            continue;
+          }
+          Matrix<Torb> C_active(C_full.rows(), n_active);
+          Vector<Tbase> n_active_vals(n_active);
+          Index col = 0;
+          for(Index k = 0; k < n_full.size(); k++) {
+            if(std::abs(n_full(k)) > tol) {
+              C_active.col(col) = C_full.col(k);
+              n_active_vals(col) = n_full(k);
+              ++col;
+            }
+          }
+          blocks[iblock] = C_active * n_active_vals.asDiagonal() * C_active.adjoint();
+        }
+        return blocks;
+      };
 
-        Tbase tr=0.0;
+      // Trace of ``(D_a - D_b) F`` given pre-materialised density
+      // blocks. Uses tr(A F) = sum_{ij} A(i,j) * F(j,i) evaluated as
+      // an element-wise product sum -- O(N^2) instead of the O(N^3)
+      // matmul-then-trace form. Combined with the pre-materialised
+      // density blocks this collapses the axis-Hessian construction
+      // from O(npars^2 * N^3) to O(npars * N^3 + npars^2 * N^2).
+      auto trace_diff = [this](const std::vector<Matrix<Torb>> & D_a,
+                               const std::vector<Matrix<Torb>> & D_b,
+                               const FockMatrix<Torb> & fock) {
+        Tbase tr = Tbase(0);
         for(size_t iblock=0; iblock<fock.size(); iblock++) {
           if(empty_block(iblock))
             continue;
-          Matrix<Torb> dD = orbitals1[iblock] * occupations1[iblock].asDiagonal() * orbitals1[iblock].adjoint()
-                          - orbitals2[iblock] * occupations2[iblock].asDiagonal() * orbitals2[iblock].adjoint();
-          tr += std::real((dD*fock[iblock]).trace());
+          const Matrix<Torb> dD = D_a[iblock] - D_b[iblock];
+          tr += std::real(
+              (dD.array() * fock[iblock].transpose().array()).sum());
         }
         return tr;
       };
@@ -1782,9 +1833,19 @@ namespace OpenOrbitalOptimizer {
       //   exact when the energy is quadratic in P (Hartree-Fock) and a
       //   second-order finite difference otherwise; symmetrized over (i,j).
       // No additional Fock evaluations beyond the npars axis vertices.
+      //
+      // Materialise D_orig and each D_axis[i] once; the trace-diff
+      // helper then does O(npars^2) elementwise-product traces on
+      // those cached blocks rather than rebuilding a density matrix
+      // per call.
+      const std::vector<Matrix<Torb>> D_orig = materialise_density(P_orig);
+      std::vector<std::vector<Matrix<Torb>>> D_axis(npars);
+      for(size_t i=0; i<npars; i++)
+        D_axis[i] = materialise_density(evaluations[i].first);
+
       Vector<Tbase> grad(npars);
       for(size_t i=0; i<npars; i++)
-        grad(i) = trace_diff(evaluations[i].first, P_orig, F_orig);
+        grad(i) = trace_diff(D_axis[i], D_orig, F_orig);
       Matrix<Tbase> hess(npars, npars);
       for(size_t i=0; i<npars; i++) {
         Tbase E_i = evaluations[i].second.first;
@@ -1792,8 +1853,8 @@ namespace OpenOrbitalOptimizer {
         for(size_t j=i+1; j<npars; j++) {
           const auto & F_j = evaluations[j].second.second;
           const auto & F_i = evaluations[i].second.second;
-          Tbase from_j = trace_diff(evaluations[i].first, P_orig, F_j) - grad(i);
-          Tbase from_i = trace_diff(evaluations[j].first, P_orig, F_i) - grad(j);
+          Tbase from_j = trace_diff(D_axis[i], D_orig, F_j) - grad(i);
+          Tbase from_i = trace_diff(D_axis[j], D_orig, F_i) - grad(j);
           hess(i, j) = 0.5*(from_j + from_i);
           hess(j, i) = hess(i, j);
         }
@@ -1856,7 +1917,7 @@ namespace OpenOrbitalOptimizer {
         Tbase E_i = evaluations[i].second.first;
         Tbase g_i = grad(i);
         Tbase H_ii = hess(i, i);
-        Tbase slope_at_1 = trace_diff(evaluations[i].first, P_orig, evaluations[i].second.second);
+        Tbase slope_at_1 = trace_diff(D_axis[i], D_orig, evaluations[i].second.second);
         auto q = HelperRoutines::fit_quartic_polynomial_with_derivatives<Tbase>(
             E_orig, g_i, H_ii, Tbase(1), E_i, slope_at_1);
         std::array<Tbase, 5> coeffs = {std::get<0>(q), std::get<1>(q), std::get<2>(q),
@@ -1882,14 +1943,12 @@ namespace OpenOrbitalOptimizer {
       // t=0 in that direction is d^T H d = H_ii + H_jj - 2 H_ij.
       for(size_t i=0; i<npars; i++) {
         for(size_t j=i+1; j<npars; j++) {
-          const auto & P_i = evaluations[i].first;
-          const auto & P_j = evaluations[j].first;
           const auto & F_i = evaluations[i].second.second;
           const auto & F_j = evaluations[j].second.second;
           Tbase E_i = evaluations[i].second.first;
           Tbase E_j = evaluations[j].second.first;
-          Tbase slope_i = trace_diff(P_j, P_i, F_i);
-          Tbase slope_j = trace_diff(P_j, P_i, F_j);
+          Tbase slope_i = trace_diff(D_axis[j], D_axis[i], F_i);
+          Tbase slope_j = trace_diff(D_axis[j], D_axis[i], F_j);
           Tbase d2_along_edge = hess(i, i) + hess(j, j) - Tbase(2) * hess(i, j);
           auto q = HelperRoutines::fit_quartic_polynomial_with_derivatives<Tbase>(
               E_i, slope_i, d2_along_edge, Tbase(1), E_j, slope_j);
@@ -2000,7 +2059,7 @@ namespace OpenOrbitalOptimizer {
           Tbase E_at_x = eval_accepted.second.first;
           Vector<Tbase> g_at_x(npars);
           for(size_t i=0; i<npars; i++)
-            g_at_x(i) = trace_diff(evaluations[i].first, P_orig, F_at_x);
+            g_at_x(i) = trace_diff(D_axis[i], D_orig, F_at_x);
           // Re-express the model anchored at x_accepted in the QP's
           // canonical (E_const + g*lambda + 0.5 lambda^T H lambda)
           // form. Expanding the Taylor around x_accepted:

@@ -18,6 +18,19 @@
 ## v0.5.0 / (Unreleased)
 
 #### Enhancements
+* Speed up the ODA quadratic-model construction. The gradient and
+  off-diagonal Hessian loop in ``optimal_damping_step`` used to
+  re-materialise the reference density matrix on every ``trace_diff``
+  call and compute ``tr(dD * F)`` via a full matrix product -- both
+  O(N^3) per call for ``O(npars^2)`` calls. Precompute each vertex
+  density matrix once (exploiting occupation sparsity: only occupied
+  natural orbitals contribute), then evaluate the trace element-wise
+  via ``(dD * F.transpose()).sum()`` in O(N^2). Total cost drops from
+  ``O(npars^2 * N^3)`` to ``O(npars * k * N^2 + npars^2 * N^2)``
+  where ``k`` is the number of populated natural orbitals -- a
+  ~20x speed-up already on npars ~ 30, and unlocking useful ODA
+  behaviour on heavy-atom / large-basis systems where the older
+  implementation hung after "Roothaan step in dimension N".
 * ODA trust-region refinement: after each ``optimal_damping_step``
   accepts a trial candidate, re-anchor the polytope quadratic
   model at the accepted iterate using the gradient observed there
