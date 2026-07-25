@@ -17,6 +17,56 @@
 
 ## v0.5.0 / (Unreleased)
 
+#### New Features
+* New ``"LCIIS"`` method token implementing the least-squares
+  commutator in the iterative subspace of Li & Yaron, J. Chem.
+  Theory Comput. **12**, 5322 (2016),
+  doi:[10.1021/acs.jctc.6b00666](https://doi.org/10.1021/acs.jctc.6b00666).
+  Where Pulay's CDIIS minimises ``|| sum_i c_i [F_i, D_i] ||_F^2``,
+  LCIIS minimises the commutator between the *predicted* Fock matrix
+  and the *predicted* density,
+  ``|| [sum_i c_i F_i, sum_j c_j D_j] ||_F^2``, which is genuinely
+  quartic in ``c`` and therefore needs the full ``M x M`` grid of
+  mixed commutators ``[F_i, D_j]`` rather than just the diagonal.
+  The quartic is minimised under ``sum_i c_i = 1`` by Newton's
+  method on the Lagrangian, seeded from the CDIIS coefficients.
+    - LCIIS is a variant of the extrapolation step, not a step of
+      its own: the token implies ``"DIIS"``, so it slots into the
+      existing state machine and the A/EDIIS bracketing continues to
+      apply. Use it as ``"LCIIS"``, ``"LCIIS + ODA + CG"``, and so on.
+      Because the two share the one extrapolation step, asking for
+      both (``"DIIS + LCIIS"``) throws rather than silently
+      discarding the DIIS request.
+    - Any failure of the quartic solve -- singular KKT matrix,
+      non-finite iterate, no convergence within the iteration cap, a
+      negative target function -- falls back to the CDIIS
+      coefficients rather than throwing. LCIIS is a convergence
+      accelerator; a bad quartic solve is a reason to take the
+      ordinary DIIS step, not to abort the SCF.
+    - Three new settings: ``lciis_maximum_history`` (default 6),
+      ``lciis_maximum_iterations`` (50) and
+      ``lciis_convergence_threshold`` (1e-10). The history cap is
+      separate from ``maximum_history_length`` because LCIIS holds
+      the whole ``M x M`` commutator grid at once, so its memory
+      grows as ``M^2 * n_basis^2`` and its commutator build as
+      ``M^2`` rather than DIIS's ``M``.
+    - On the oxygen atom with PBE/cc-pVDZ, LCIIS reaches the same
+      energies as DIIS in fewer iterations (7 vs 9 at M=1, 8 vs 9 at
+      M=3).
+* ``atomtest`` gained a ``--methods`` flag that overrides the
+  driver's default method mix, so any token combination can be
+  exercised from the command line.
+
+#### Breaking Changes
+* Requesting two methods that occupy the same slot now throws
+  instead of silently resolving to one of them. This affects
+  ``"CG + LBFGS"``, which previously ran L-BFGS and quietly ignored
+  the ``CG`` request -- the two are alternative implementations of
+  the single orbital-rotation step, not steps that can both run.
+  The new ``"DIIS + LCIIS"`` combination is rejected for the same
+  reason. Method strings naming only one of each pair are
+  unaffected.
+
 #### Enhancements
 * ODA now tries a "collapsed" polytope first: when the full
   skeleton enumeration would exceed ``n_particle_types``, each
