@@ -31,17 +31,23 @@
   the smudged density has support in every degenerate orbital, so
   the SCF can't collapse onto a symmetry-broken saddle from the
   first-iteration guess.
-* Convergence-time full-polytope check. Every iteration where
-  ``converged() == true`` and ODA is allowed, ``run()`` invokes
+* Convergence-time full-polytope check. When ``run()`` sees
+  ``converged() == true``, ODA is allowed, and the last ODA step
+  used the collapsed skeleton set, it invokes
   ``optimal_damping_step(force_full=true)`` before breaking the
   SCF loop. That confirms the converged iterate is stationary in
-  the full skeleton set and not just in the collapsed one; each
-  accepted step strictly lowers the energy, so the sequence of
-  such checks is finite -- no book-keeping across iterations.
-  After a successful descent the state machine picks the same
+  the full skeleton set and not just in the collapsed one;
+  sub-noise descents (below
+  ``0.1 * max(convergence_threshold, K * noise_floor)``, the same
+  tolerance the trust-region refit loop uses) are rejected so an
+  already-converged SCF doesn't churn at the arithmetic floor.
+  After a genuine descent the state machine picks the same
   ``{OrbitalRotation, DIIS, ODA}`` preference the normal post-ODA
   transition uses, so the next step relaxes at the new
   occupations before revisiting DIIS.
+* The per-iteration orbital-occupations block in the verbose SCF
+  trace now prints before the ``converged()`` check, so the
+  occupations at the final iterate reach the log.
 * Speed up the ODA quadratic-model construction and the whole
   DIIS / ADIIS / EDIIS extrapolation stack via a coordinated
   refactor of the ``C * diag(n) * C^dagger`` and
