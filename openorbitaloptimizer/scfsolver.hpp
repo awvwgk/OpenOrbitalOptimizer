@@ -72,6 +72,32 @@ namespace OpenOrbitalOptimizer {
       return std::make_pair(x1, x2);
     }
 
+    /// Project ``v`` onto the simplex {v_i >= 0, sum(v) <= 1}:
+    /// negative entries are clamped to zero, and if the sum then
+    /// still exceeds one the whole vector is rescaled by 1/sum.
+    ///
+    /// Rescaling rather than merely capping the sum matters wherever
+    /// the individual entries are used as weights in their own right:
+    /// capping the sum alone would leave the entries summing to more
+    /// than one while the complementary weight (1 - sum) went to
+    /// zero, which shifts the total.
+    ///
+    /// Used on the ODA polytope parameters, where the QP solver
+    /// enforces the simplex only to the accuracy of its constrained
+    /// linear solve. An ill-conditioned reduced Hessian -- what a
+    /// density projected between two different basis sets produces --
+    /// can leave the sum above one by of order cond * eps, which
+    /// hands the reference density a negative weight and yields a
+    /// non-positive-semidefinite mixed density.
+    template<typename T>
+    void project_onto_unit_simplex(Vector<T> & v) {
+      for(Index i = 0; i < v.size(); i++)
+        if(v(i) < T(0)) v(i) = T(0);
+      T s = v.sum();
+      if(s > T(1))
+        v /= s;
+    }
+
     /// Evaluate a polynomial with the given coefficients (index i =
     /// coefficient of x^i) at ``x`` via Horner's scheme.
     template<typename T, size_t N>
@@ -1791,7 +1817,23 @@ namespace OpenOrbitalOptimizer {
           size_t ntrial = trial_occupations_per_particle[iparticle].size();
           if(ntrial==0)
             continue;
-          Tbase lambda_sum = lambda.segment(iparam, ntrial).sum();
+          // Project this particle's lambda block onto its simplex
+          // {lambda >= 0, sum(lambda) <= 1} before using it.
+          //
+          // The QP solver enforces that simplex only to the accuracy
+          // of its constrained linear solve, so an ill-conditioned
+          // reduced Hessian -- exactly what a starting density
+          // projected between two different basis sets produces --
+          // can leave sum(lambda) above 1 by of order cond * eps.
+          // Any overshoot hands old_dm a negative weight and makes
+          // the mixed density non-positive-semidefinite, which then
+          // surfaces far downstream as a negative natural occupation.
+          // Nothing in the algorithm wants lambda outside the
+          // simplex: the trial loop only ever scales candidates
+          // *down*, so clamping here loses no intended step.
+          Vector<Tbase> lam_p = lambda.segment(iparam, ntrial);
+          HelperRoutines::project_onto_unit_simplex<Tbase>(lam_p);
+          const Tbase lambda_sum = lam_p.sum();
 
           for(size_t iblock_particle = 0; iblock_particle < (size_t)number_of_blocks_per_particle_type_(iparticle); iblock_particle++) {
             size_t iblock = iblock_particle + particle_block_offset(iparticle);
@@ -1802,9 +1844,9 @@ namespace OpenOrbitalOptimizer {
                 reference_orbitals[iblock], reference_occupations[iblock],
                 maximum_occupation_(iblock));
 
-            Vector<Tbase> new_occ = lambda(iparam)*trial_occupations_per_particle[iparticle][0][iblock_particle];
+            Vector<Tbase> new_occ = lam_p(0)*trial_occupations_per_particle[iparticle][0][iblock_particle];
             for(size_t itrial=1; itrial<ntrial; itrial++)
-              new_occ += lambda(iparam+itrial)*trial_occupations_per_particle[iparticle][itrial][iblock_particle];
+              new_occ += lam_p(itrial)*trial_occupations_per_particle[iparticle][itrial][iblock_particle];
 
             Matrix<Torb> new_dm = build_density_block_(
                 new_orbitals[iblock], new_occ, maximum_occupation_(iblock));
@@ -1816,13 +1858,32 @@ namespace OpenOrbitalOptimizer {
             interp_orbs[iblock] = es.eigenvectors();
             interp_occs[iblock] *= Tbase{-1};
 
-            const Tbase zero_tol = 10*maximum_occupation_(iblock)*std::numeric_limits<Tbase>::epsilon();
+            // Noise tolerances for the natural occupations. Both are
+            // powers of epsilon so they stay tight in extended
+            // precision, and both scale with the block's occupation
+            // magnitude.
+            //
+            // An absolute multiple of epsilon is right for a density
+            // that was just built, but far too tight for one that has
+            // been projected between basis sets and then mixed: the
+            // eigendecomposition of such a matrix carries error of
+            // order cond * eps, which can be thousands of epsilons.
+            //   zero_tol = sqrt(eps)      ~ 1.5e-8 (double), 1e-17 (quad)
+            //   fail_tol = eps^(1/4)      ~ 1.2e-4 (double), 1e-8  (quad)
+            // Occupations below zero_tol are chemically meaningless
+            // and are clamped to zero; the guard then fires only on
+            // occupations negative enough to mean a genuinely corrupt
+            // density (order 0.1), never on numerical noise.
+            const Tbase eps_occ   = std::numeric_limits<Tbase>::epsilon();
+            const Tbase occ_scale = std::max(Tbase(1), maximum_occupation_(iblock));
+            const Tbase zero_tol  = std::sqrt(eps_occ) * occ_scale;
+            const Tbase fail_tol  = std::sqrt(std::sqrt(eps_occ)) * occ_scale;
             for(Index k=0; k<interp_occs[iblock].size(); k++) {
               if(std::abs(interp_occs[iblock](k)) <= zero_tol)
                 interp_occs[iblock](k) = Tbase{0};
             }
 
-            if(interp_occs[iblock].minCoeff() < -100*std::numeric_limits<Tbase>::epsilon()) {
+            if(interp_occs[iblock].minCoeff() < -fail_tol) {
               std::ostringstream oss;
               oss << "Negative natural occupation numbers in block " << iblock << "!\n" << interp_occs[iblock];
               throw std::logic_error(oss.str());
