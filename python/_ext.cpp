@@ -58,17 +58,31 @@ PYBIND11_MODULE(_ext, m) {
          "Return the catalog of every solver option: name, type,\n"
          "writability, one-line description.",
          py::return_value_policy::reference)
-    .def("set",
-         py::overload_cast<const std::string&, double>(&Solver::set),
-         py::arg("key"), py::arg("value"),
-         "Set a real-valued option by name.")
-    .def("set",
-         py::overload_cast<const std::string&, int>(&Solver::set),
+    // C++-side `set` is a SFINAE-constrained member template (a plain
+    // (Tbase) / (int) overload pair is ambiguous for any Tbase that is
+    // not double), so py::overload_cast cannot name it. Bind the
+    // explicit typed entry points instead and let pybind11 dispatch.
+    //
+    // Registration order matters: pybind11 first tries every overload
+    // with conversions disabled, then retries allowing them. Listing
+    // the integer form first means integral values that require a
+    // conversion (numpy integer scalars, say) land in set_int rather
+    // than being silently widened to the real setter.
+    .def("set", &Solver::set_int,
          py::arg("key"), py::arg("value"),
          "Set an integer-valued option by name.")
-    .def("set",
-         py::overload_cast<const std::string&, const std::string&>(&Solver::set),
+    .def("set", &Solver::set_real,
          py::arg("key"), py::arg("value"),
+         "Set a real-valued option by name.")
+    .def("set", &Solver::set_string,
+         py::arg("key"), py::arg("value"),
+         "Set a string-valued option by name.")
+    // The same three under their explicit names, mirroring the getters.
+    .def("set_int",    &Solver::set_int,    py::arg("key"), py::arg("value"),
+         "Set an integer-valued option by name.")
+    .def("set_real",   &Solver::set_real,   py::arg("key"), py::arg("value"),
+         "Set a real-valued option by name.")
+    .def("set_string", &Solver::set_string, py::arg("key"), py::arg("value"),
          "Set a string-valued option by name.")
     .def("get_real", &Solver::get_real, py::arg("key"),
          "Get a real-valued option or diagnostic by name.")

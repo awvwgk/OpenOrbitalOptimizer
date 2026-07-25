@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -213,6 +214,74 @@ int main() {
     // Clearing the logger restores the stdout default.
     logger_solver.logger(nullptr);
     REQUIRE(!logger_solver.has_logger());
+  }
+
+  // ODA simplex projection. Regression test for a HelFEM report where
+  // an SCF started from a density projected between two different FEM
+  // bases aborted with "Negative natural occupation numbers", the
+  // smallest natural occupation being about -5.7e-12 -- some 26000
+  // machine epsilons, far above eigensolver roundoff, i.e. a real
+  // simplex overshoot rather than noise.
+  //
+  // The ODA polytope is {lambda >= 0, sum(lambda) <= 1}, and the trial
+  // loop only ever scales candidates down, so nothing in the algorithm
+  // wants lambda outside it. But the QP solver enforces the simplex
+  // only to the accuracy of its constrained linear solve, and an
+  // ill-conditioned reduced Hessian (exactly what a cross-basis
+  // projection produces) leaves sum(lambda) above one by of order
+  // cond * eps. Any overshoot gives the reference density a negative
+  // weight, so the mixed density is no longer positive semidefinite.
+  {
+    using OpenOrbitalOptimizer::HelperRoutines::project_onto_unit_simplex;
+    const double eps = std::numeric_limits<double>::epsilon();
+
+    // The reported failure mode: sum marginally above one.
+    {
+      Vector<double> lam(2);
+      lam << 0.5, 0.5 + 3e-12;
+      const double before = lam.sum();
+      project_onto_unit_simplex<double>(lam);
+      REQUIRE(before > 1.0);              // precondition: really overshoots
+      REQUIRE(lam.sum() <= 1.0);
+      REQUIRE(lam.minCoeff() >= 0.0);
+      // Rescaling preserves the direction, so the ratio is untouched.
+      REQUIRE(std::abs(lam(0)/lam(1) - 0.5/(0.5 + 3e-12)) < 1e-12);
+    }
+    // A point strictly inside the simplex must be left alone.
+    {
+      Vector<double> lam(3);
+      lam << 0.25, 0.25, 0.25;
+      project_onto_unit_simplex<double>(lam);
+      REQUIRE(std::abs(lam(0) - 0.25) <= eps);
+      REQUIRE(std::abs(lam(1) - 0.25) <= eps);
+      REQUIRE(std::abs(lam(2) - 0.25) <= eps);
+    }
+    // A point exactly on the sum-cap face is inside, not outside.
+    {
+      Vector<double> lam(2);
+      lam << 0.5, 0.5;
+      project_onto_unit_simplex<double>(lam);
+      REQUIRE(std::abs(lam.sum() - 1.0) <= eps);
+    }
+    // Negative entries are clamped, and clamping alone can bring the
+    // sum back inside without any rescaling.
+    {
+      Vector<double> lam(2);
+      lam << 1.2, -0.4;
+      project_onto_unit_simplex<double>(lam);
+      REQUIRE(lam.minCoeff() >= 0.0);
+      REQUIRE(lam.sum() <= 1.0 + eps);
+    }
+    // Gross overshoot rescales rather than truncates: every entry
+    // stays positive and the sum lands on the cap.
+    {
+      Vector<double> lam(3);
+      lam << 1.0, 0.5, 0.5;
+      project_onto_unit_simplex<double>(lam);
+      REQUIRE(std::abs(lam.sum() - 1.0) <= 4*eps);
+      REQUIRE(lam.minCoeff() > 0.0);
+      REQUIRE(std::abs(lam(0) - 0.5) <= 4*eps);
+    }
   }
 
   std::printf("%s: %d failure(s)\n", __FILE__, failures);

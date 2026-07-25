@@ -127,8 +127,8 @@
   is below noise, so idle refits cost nothing on well-conditioned
   problems.
 * ODA candidate selection is now model-first. The polytope
-  quadratic-model minimum and the 1D probes (quartic per axis,
-  quartic per pair-diagonal edge) are ranked by their
+  quadratic-model minimum and the 1D cubic Hermite probes (one per
+  axis, one per pair-diagonal edge) are ranked by their
   polynomial-predicted energy, and the trial loop evaluates them in
   that order. Along a linear ray in density space the Hartree-Fock
   energy is exactly quadratic and the polynomial fits are exact for
@@ -136,12 +136,11 @@
   first candidate is normally the accepted step -- one Fock build
   per ODA call in place of the worst-case
   O(candidates × backoff scales) sweep.
-* Promoted the axis and edge 1D probes from cubic to quartic
-  Hermite. The diagonal Hessian block `H_ii` (on an axis) and the
-  edge-projected Hessian `H_ii + H_jj - 2 H_ij` (on a pair-diagonal
-  edge) supply the fifth Hermite data point at zero additional Fock
-  cost, so the quartic captures DFT non-quadraticity that the
-  earlier cubic missed.
+* The 1D probes emit only interior *minima* of the fitted cubic
+  (the second root of the derivative is a maximum and is never a
+  useful trial step), and de-duplicate the doubled root returned
+  when the cubic degenerates to a quadratic. Axis and edge probes
+  now share one fitting routine.
 
 #### New Features (continued)
 * Route all library log output through a caller-installable
@@ -231,6 +230,33 @@
   Armadillo compatibility shim.
 
 #### Bug Fixes
+* ODA no longer aborts with "Negative natural occupation numbers"
+  on an SCF started from a density projected between two
+  different basis sets. Two independent problems fed the same
+  crash, and both are fixed.
+    - The polytope parameters are now projected onto their
+      simplex ``{lambda >= 0, sum(lambda) <= 1}`` before the
+      mixed density is built. The bound-constrained solve
+      enforces that simplex only to the accuracy of its
+      constrained linear solve, so an ill-conditioned reduced
+      Hessian -- exactly what a cross-basis projection produces
+      -- can leave ``sum(lambda)`` above one by of order
+      ``cond * eps``. Any overshoot gives the reference density a
+      negative weight, so the mixed density is no longer positive
+      semidefinite. The trial loop only ever scales candidates
+      *down*, so nothing in the algorithm wanted a step outside
+      the simplex in the first place.
+    - The natural-occupation noise tolerances are now derived
+      from powers of the machine epsilon and scaled by the
+      block's maximum occupation: values below ``sqrt(eps)`` are
+      clamped to zero, and the abort fires below
+      ``-eps^(1/4)``. The old absolute ``10 * eps`` / ``100 * eps``
+      cutoffs were right for a freshly built density but far too
+      tight for a projected-and-mixed one, whose eigendecomposition
+      carries error of order ``cond * eps``. The guard now
+      triggers only on occupations negative enough to mean a
+      genuinely corrupt density, and the thresholds still tighten
+      automatically in ``__float128``.
 * Corrected the ADIIS linear-term docstring: the loop actually
   computes ``2 * <D_i - D_0 | F_0>`` (the standard ADIIS model of
   Hu & Yang, JCP 132, 054109), not ``2 * <D_i - D_0 | F_i - F_0>``

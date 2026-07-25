@@ -34,6 +34,7 @@
 
 #include <complex>
 #include <functional>
+#include <memory>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -142,7 +143,17 @@ namespace Armadillo {
 
     /// User-supplied Armadillo-typed Fock builder, kept alive so the
     /// bridging callback below can call it on every Fock evaluation.
-    FockBuilder<Torb, Tbase> arma_fock_builder_;
+    ///
+    /// Held behind a shared_ptr, and captured *by value* into the
+    /// bridging lambda, so that the callback owns a share of the
+    /// builder rather than pointing back at this object. Capturing
+    /// ``this`` instead would make the class unsafe to move: the
+    /// underlying solver is move-constructible and move-assignable,
+    /// so a moved-from wrapper would leave the destination's solver
+    /// calling into the source's (now moved-from, soon destroyed)
+    /// builder -- std::bad_function_call at best, use-after-free once
+    /// the source dies. With a shared_ptr the move is correct.
+    std::shared_ptr<FockBuilder<Torb, Tbase>> arma_fock_builder_;
     /// Underlying Eigen-based solver. Constructed second so that the
     /// bridging lambda captured below can already see arma_fock_builder_.
     EigenSolver impl_;
@@ -153,15 +164,16 @@ namespace Armadillo {
               const arma::Col<Tbase> & number_of_particles,
               const FockBuilder<Torb, Tbase> & fock_builder,
               const std::vector<std::string> & block_descriptions)
-      : arma_fock_builder_(fock_builder),
+      : arma_fock_builder_(
+            std::make_shared<FockBuilder<Torb, Tbase>>(fock_builder)),
         impl_(to_eigen(number_of_blocks_per_particle_type),
               to_eigen(maximum_occupation),
               to_eigen(number_of_particles),
-              [this](const EigenDM & dm) -> EigenFR {
+              [builder = arma_fock_builder_](const EigenDM & dm) -> EigenFR {
                 DensityMatrix<Torb, Tbase> arma_dm{
                     to_arma(dm.first),
                     to_arma(dm.second)};
-                FockBuilderReturn<Torb, Tbase> arma_ret = arma_fock_builder_(arma_dm);
+                FockBuilderReturn<Torb, Tbase> arma_ret = (*builder)(arma_dm);
                 return std::make_pair(arma_ret.first, to_eigen(arma_ret.second));
               },
               block_descriptions) {}

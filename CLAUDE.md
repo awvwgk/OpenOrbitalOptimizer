@@ -10,12 +10,16 @@ The library is templated on two types: `SCFSolver<Torb, Tbase>` where `Torb` is 
 
 ## Layout
 
-- `openorbitaloptimizer/scfsolver.hpp` — the entire SCF solver as one header (~2450 lines). All public API lives in `class SCFSolver` (see line 1599 onward). Includes DIIS/EDIIS/ADIIS history mixing and Aufbau occupation logic across arbitrary numbers of particle types and symmetry blocks.
-- `openorbitaloptimizer/cg_optimizer.hpp` — small Polak-Ribière conjugate gradient routine used internally for line-search-style sub-problems.
-- `openorbitaloptimizer/oda.hpp` — optimal damping algorithm step (included into the solver).
+- `openorbitaloptimizer/scfsolver.hpp` — the entire SCF solver as one header (~4800 lines). All public API lives in `class SCFSolver`; the `public:` section starts around line 3440. Includes DIIS/EDIIS/ADIIS history mixing, the optimal-damping (ODA) polytope step, preconditioned CG / L-BFGS orbital rotations, and Aufbau occupation logic across arbitrary numbers of particle types and symmetry blocks.
+- `openorbitaloptimizer/types.hpp` — library typedefs (`Matrix<T>`, `Vector<T>`, `IndexVector`, `FockBuilder`, and the per-block container shorthands) over Eigen.
+- `openorbitaloptimizer/eigen_compat.hpp` — small inline helpers filling gaps in Eigen's API (`vectorise_real_imag`, `find_indices_where`, `sort_index_ascending`, `has_nan`/`has_inf`, `expm_antihermitian`).
+- `openorbitaloptimizer/quad_support.hpp` — opt-in `_Float128` glue: `numeric_limits`, math overloads and `Eigen::NumTraits`. Only include it if you want quad precision.
+- `openorbitaloptimizer/armadillo_compat.hpp` — opt-in compatibility shim exposing the pre-Eigen Armadillo-typed API, kept so downstream Armadillo-only codes (e.g. ERKALE) need not migrate. The core library does not depend on Armadillo.
 - `tests/atomtest.cpp` — the main functional test: an atomic SCF/DFT driver using a radial grid (IntegratorXX), Libxc functionals, and BSE-format JSON or ADF-format STO basis sets. Has restricted, unrestricted, and nuclear-electronic-orbital (NEO) drivers. CLI parsed via `tests/cmdline.h`.
 - `tests/atomicsolver.hpp` — radial basis abstractions (GTO + STO) used only by `atomtest`.
-- `tests/{float_float,cplxfloat_float,cplxdouble_double}.cpp` — compile-only template instantiation tests for the non-default `(Torb,Tbase)` pairs.
+- `tests/settings_roundtrip.cpp` — runtime coverage of the string-keyed settings façade: `options()` catalog round-trip, unknown/wrong-type key rejection, `print_settings`, citation, and the log-sink callback.
+- `tests/{float_real,float_complex,double_complex,quad_real,quad_complex}.cpp` — compile-only template instantiation tests for the non-default `(Torb,Tbase)` pairs.
+- `tests/settings_api_check.hpp` — included by every instantiation test; forces instantiation of the settings-façade member templates, which explicit class instantiation does not cover.
 - `cmake/` — `OpenOrbitalOptimizerConfig.cmake.in` and an Armadillo-target healing helper for Conda Windows builds.
 
 ## Build and test
@@ -54,7 +58,10 @@ Other notable flags: `--Q` (charge), `--restricted` (-1=auto), `--Ngrid`, `--sto
 ## Conventions
 
 - Mozilla Public License 2.0; preserve the MPL header on existing files and add it to new ones.
-- The library is a single header. Keep the public API on `SCFSolver` and put helper utilities in the existing namespaces (`OpenOrbitalOptimizer`, `OpenOrbitalOptimizer::ConjugateGradients`).
+- The solver is a single header. Keep the public API on `SCFSolver` and put helper utilities in the existing namespaces (`OpenOrbitalOptimizer`, `OpenOrbitalOptimizer::HelperRoutines`).
+- Solver options are configured through the string-keyed façade — `set(key, value)`, `get_real`/`get_int`/`get_string(key)`, and the static `options()` catalog. There are no per-option typed accessors. When adding a knob, update the member, the matching `set_*`/`get_*` branch, and `options()` together.
 - The library does not depend on Libxc/IntegratorXX/nlohmann_json — only the tests do. Do not introduce these (or any other) dependencies into `openorbitaloptimizer/`.
-- The library must remain instantiable for all four `(Torb,Tbase)` combinations; when changing template code, build the `openorbopt-instantiation-*` targets to verify.
+- Use `Tbase(...)` for numeric literals in solver arithmetic; a bare `double` literal silently promotes the computation to double precision in the `float` and `_Float128` instantiations.
+- Numeric arguments passed to `log_()` must be cast to `double` explicitly: `_Float128` is not promoted through varargs, so an uncast `Tbase` is undefined behaviour in the quad instantiation. `log_stream_()` has no such restriction.
+- The library must remain instantiable for all `(Torb,Tbase)` combinations; when changing template code, build the `openorbopt-instantiation-*` targets to verify. Note that explicit class-template instantiation does not instantiate member templates — `tests/settings_api_check.hpp` exists to cover the settings façade for every pair.
 - `objdir/`, `runs/`, `psi4/`, `openorbital.old/`, and various `*~` / `#*#` editor backups in the working tree are local artifacts — do not commit them.
