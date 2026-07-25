@@ -284,6 +284,93 @@ int main() {
     }
   }
 
+  // LCIIS method token. LCIIS is a variant of the extrapolation step
+  // rather than a step of its own, so the token has to imply DIIS --
+  // every state-machine gate gets asked "is DIIS allowed?", never
+  // "is LCIIS allowed?".
+  {
+    auto s = make_solver();
+    s.set(std::string("methods"), std::string("lciis"));
+    REQUIRE(s.get_string("methods") == "LCIIS");
+
+    s.set(std::string("methods"), std::string("LCIIS + ODA + CG"));
+    REQUIRE(s.get_string("methods") == "LCIIS + ODA + CG");
+
+    // Unknown tokens are still rejected, and the diagnostic advertises
+    // LCIIS alongside the others.
+    bool threw = false;
+    std::string what;
+    try { s.set(std::string("methods"), std::string("not_a_method")); }
+    catch (const std::logic_error & e) { threw = true; what = e.what(); }
+    REQUIRE(threw);
+    REQUIRE(what.find("LCIIS") != std::string::npos);
+
+    // Asking for both is refused rather than silently resolved: LCIIS
+    // substitutes for the CDIIS solve inside the single extrapolation
+    // step, so honouring both is not possible and quietly dropping the
+    // DIIS request would be worse than an error.
+    for (const char * combo : {"DIIS + LCIIS", "LCIIS + DIIS",
+                               "diis + lciis + ODA + CG"}) {
+      threw = false; what.clear();
+      try { s.set(std::string("methods"), std::string(combo)); }
+      catch (const std::logic_error & e) { threw = true; what = e.what(); }
+      if (!threw) {
+        std::printf("FAIL: '%s' was accepted\n", combo);
+        ++failures;
+      } else {
+        REQUIRE(what.find("DIIS") != std::string::npos);
+        REQUIRE(what.find("LCIIS") != std::string::npos);
+      }
+    }
+    // A rejected set() must not have disturbed the stored value.
+    REQUIRE(s.get_string("methods") == "LCIIS + ODA + CG");
+
+    // The same rule one level down: CG and LBFGS are alternative
+    // implementations of the single orbital-rotation step, so asking
+    // for both is refused rather than resolved by a silent preference.
+    for (const char * combo : {"CG + LBFGS", "LBFGS + CG",
+                               "DIIS + ODA + cg + lbfgs"}) {
+      threw = false; what.clear();
+      try { s.set(std::string("methods"), std::string(combo)); }
+      catch (const std::logic_error & e) { threw = true; what = e.what(); }
+      if (!threw) {
+        std::printf("FAIL: '%s' was accepted\n", combo);
+        ++failures;
+      } else {
+        REQUIRE(what.find("CG") != std::string::npos);
+        REQUIRE(what.find("LBFGS") != std::string::npos);
+      }
+    }
+    // Each on its own is still fine.
+    s.set(std::string("methods"), std::string("DIIS + ODA + CG"));
+    REQUIRE(s.get_string("methods") == "DIIS + ODA + CG");
+    s.set(std::string("methods"), std::string("DIIS + ODA + LBFGS"));
+    REQUIRE(s.get_string("methods") == "DIIS + ODA + LBFGS");
+
+    // An LCIIS-driven run reaches the same solution as the plain DIIS
+    // one on this (trivial, one-block) problem. The point is that the
+    // quartic solve runs at all and hands back usable weights rather
+    // than falling over -- the real convergence comparison lives in
+    // atomtest.
+    FockMatrix<double> g(1);
+    g[0] = Matrix<double>::Identity(2, 2) * -1.0;
+
+    auto ref = make_solver();
+    ref.initialize_with_fock(g);
+    ref.set(std::string("methods"), std::string("DIIS"));
+    ref.set(std::string("maximum_iterations"), 20);
+    ref.run();
+
+    auto lc = make_solver();
+    lc.initialize_with_fock(g);
+    lc.set(std::string("methods"), std::string("LCIIS"));
+    lc.set(std::string("maximum_iterations"), 20);
+    lc.run();
+
+    REQUIRE(lc.converged());
+    REQUIRE(std::abs(lc.get_energy() - ref.get_energy()) < 1e-10);
+  }
+
   std::printf("%s: %d failure(s)\n", __FILE__, failures);
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }
