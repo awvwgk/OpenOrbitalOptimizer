@@ -504,6 +504,28 @@ namespace OpenOrbitalOptimizer {
       return std::get<1>(orbital_history_[0]).second[iblock].size() == 0;
     }
 
+    /// Materialise every block of a density matrix from its
+    /// natural-orbital / occupation representation. Used to hoist the
+    /// C * diag(n) * C^dagger builds out of the O(npars^2) ODA
+    /// Hessian loop so each vertex density is constructed once;
+    /// combined with ``tr_of_product_`` this collapses the axis-
+    /// Hessian construction from O(npars^2 * N^3) to
+    /// O(npars * N^3 + npars^2 * N^2).
+    std::vector<Matrix<Torb>> build_density_blocks_(
+        const DensityMatrix<Torb,Tbase> & dm) const {
+      const auto & orbitals = dm.first;
+      const auto & occupations = dm.second;
+      std::vector<Matrix<Torb>> blocks(orbitals.size());
+      for(size_t iblock=0; iblock<orbitals.size(); iblock++) {
+        if(empty_block(iblock))
+          continue;
+        blocks[iblock] = build_density_block_(
+            orbitals[iblock], occupations[iblock],
+            maximum_occupation_(iblock));
+      }
+      return blocks;
+    }
+
     /// Get a block of the density matrix for the ihist:th entry
     Matrix<Torb> get_density_matrix_block(size_t ihist, size_t iblock) const {
       return build_density_block_(
@@ -522,6 +544,41 @@ namespace OpenOrbitalOptimizer {
       return std::real((A.array() * B.transpose().array()).sum());
     }
 
+    /// Extract the natural orbitals carrying a non-negligible
+    /// occupation: the columns of ``C`` whose occupation exceeds
+    /// ``10 * max_occ * epsilon`` in magnitude, together with those
+    /// occupations. Restricting the rank-k density and commutator
+    /// builds to these ``k`` columns is what makes them
+    /// O(k * n_basis^2) instead of O(n_basis^3), which is the whole
+    /// point whenever ``k << n_basis`` -- atoms, small molecules,
+    /// ODA polytope vertices, brute-force search trial occupations.
+    ///
+    /// The outputs are resized to match; ``n_active.size() == 0``
+    /// means the block carries no density at all, which callers must
+    /// special-case since the rank-k products are then empty.
+    void active_natural_orbitals_(
+        const OrbitalBlock<Torb> & C,
+        const OrbitalBlockOccupations<Tbase> & n,
+        Tbase max_occ,
+        Matrix<Torb> & C_active,
+        Vector<Tbase> & n_active) const {
+      const Tbase tol =
+          Tbase(10) * max_occ * std::numeric_limits<Tbase>::epsilon();
+      Index count = 0;
+      for(Index k = 0; k < n.size(); k++)
+        if(std::abs(n(k)) > tol) ++count;
+      C_active.resize(C.rows(), count);
+      n_active.resize(count);
+      Index col = 0;
+      for(Index k = 0; k < n.size(); k++) {
+        if(std::abs(n(k)) > tol) {
+          C_active.col(col) = C.col(k);
+          n_active(col) = n(k);
+          ++col;
+        }
+      }
+    }
+
     /// Build a density-matrix block C * diag(n) * C^dagger from the
     /// natural-orbital / occupation representation, dropping natural
     /// orbitals with a zero occupation before the outer product. The
@@ -534,24 +591,12 @@ namespace OpenOrbitalOptimizer {
         const OrbitalBlock<Torb> & C,
         const OrbitalBlockOccupations<Tbase> & n,
         Tbase max_occ) const {
-      const Tbase tol =
-          Tbase(10) * max_occ * std::numeric_limits<Tbase>::epsilon();
-      Index n_active = 0;
-      for(Index k = 0; k < n.size(); k++)
-        if(std::abs(n(k)) > tol) ++n_active;
-      if(n_active == 0)
+      Matrix<Torb> C_active;
+      Vector<Tbase> n_active;
+      active_natural_orbitals_(C, n, max_occ, C_active, n_active);
+      if(n_active.size() == 0)
         return Matrix<Torb>::Zero(C.rows(), C.rows());
-      Matrix<Torb> C_active(C.rows(), n_active);
-      Vector<Tbase> n_active_vals(n_active);
-      Index col = 0;
-      for(Index k = 0; k < n.size(); k++) {
-        if(std::abs(n(k)) > tol) {
-          C_active.col(col) = C.col(k);
-          n_active_vals(col) = n(k);
-          ++col;
-        }
-      }
-      return C_active * n_active_vals.asDiagonal() * C_active.adjoint();
+      return C_active * n_active.asDiagonal() * C_active.adjoint();
     }
 
     /// Get a block of the orbital occupations for the ihist:th entry
@@ -757,28 +802,18 @@ namespace OpenOrbitalOptimizer {
       Matrix<Torb> F_sym = (Tbase(1)/Tbase(2)) * (F + F.adjoint());
 
       // Extract occupied natural orbitals for the rank-k FP build.
-      const auto C_full = get_orbital_block(ihist, iblock);
-      const auto occ    = get_orbital_occupation_block(ihist, iblock);
-      const Tbase tol   = Tbase(10) * maximum_occupation_(iblock)
-                        * std::numeric_limits<Tbase>::epsilon();
-      Index n_active = 0;
-      for(Index k = 0; k < occ.size(); k++)
-        if(std::abs(occ(k)) > tol) ++n_active;
-      Matrix<Torb> C_active(C_full.rows(), n_active);
-      Vector<Tbase> n_active_vals(n_active);
-      Index col = 0;
-      for(Index k = 0; k < occ.size(); k++)
-        if(std::abs(occ(k)) > tol) {
-          C_active.col(col)  = C_full.col(k);
-          n_active_vals(col) = occ(k);
-          ++col;
-        }
-      if(n_active == 0) {
+      Matrix<Torb> C_active;
+      Vector<Tbase> n_active;
+      active_natural_orbitals_(get_orbital_block(ihist, iblock),
+                               get_orbital_occupation_block(ihist, iblock),
+                               maximum_occupation_(iblock),
+                               C_active, n_active);
+      if(n_active.size() == 0) {
         blocks[iblock] = Matrix<Torb>::Zero(F_sym.rows(), F_sym.cols());
         return blocks[iblock];
       }
       Matrix<Torb> FC = F_sym * C_active;                  // O(N^2 * k)
-      Matrix<Torb> FP = FC * n_active_vals.asDiagonal()
+      Matrix<Torb> FP = FC * n_active.asDiagonal()
                      * C_active.adjoint();                 // O(N^2 * k)
       // PF = (FP)^dagger since F and P are Hermitian.
       blocks[iblock] = FP - FP.adjoint();
@@ -874,6 +909,24 @@ namespace OpenOrbitalOptimizer {
         mock[iblock] = Matrix<Torb>::Constant(n, n, seed);
       }
       return norm(vectorise(mock));
+    }
+
+    /// The convergence threshold actually in force: the user's
+    /// ``convergence_threshold_``, raised to
+    /// ``noise_safety_factor_ * noise_floor_`` whenever the
+    /// arithmetic noise floor sits above it, so the SCF never chases
+    /// a threshold below what the working precision can resolve.
+    Tbase effective_convergence_threshold_() const {
+      return std::max(convergence_threshold_,
+                      noise_safety_factor_ * noise_floor_);
+    }
+
+    /// Smallest energy descent that can still change the outer SCF's
+    /// stopping decision: one tenth of the effective convergence
+    /// threshold. Steps that squeeze out less than this are rejected
+    /// as noise rather than accepted as progress.
+    Tbase minimum_useful_descent_() const {
+      return effective_convergence_threshold_() / Tbase(10);
     }
 
     /// Compute element of DIIS error matrix
@@ -1295,6 +1348,57 @@ namespace OpenOrbitalOptimizer {
       return extrapolated_fock;
     }
 
+    /// Re-diagonalise a Hermitian density-matrix block into its
+    /// natural-orbital representation. The sign is flipped before the
+    /// eigendecomposition because Eigen returns eigenvalues in
+    /// ascending order, so diagonalising ``-D`` and negating back
+    /// yields the occupations in descending order -- the conventional
+    /// natural-orbital ordering, with the populated orbitals first.
+    ///
+    /// Occupations whose magnitude is at or below ``zero_tol`` are
+    /// snapped to exactly zero. The caller supplies that tolerance
+    /// because the right value depends on the provenance of the
+    /// density: a freshly built one carries only elementwise
+    /// roundoff, while one that has been projected between basis
+    /// sets and then mixed carries error of order ``cond * eps``.
+    ///
+    /// No positivity check is made here, and deliberately so. A
+    /// convex combination of densities must come out positive
+    /// semidefinite, but the DIIS extrapolation is an *affine*
+    /// combination whose weights may be negative, so negative
+    /// natural occupations are a normal outcome there. Callers that
+    /// do require a genuine density check with
+    /// ``require_nonnegative_occupations_``.
+    void natural_orbitals_(const Matrix<Torb> & dm_block,
+                           Tbase zero_tol,
+                           Matrix<Torb> & orbitals,
+                           Vector<Tbase> & occupations) const {
+      Matrix<Torb> neg_dm = -dm_block;
+      Eigen::SelfAdjointEigenSolver<Matrix<Torb>> es(neg_dm);
+      occupations = es.eigenvalues();
+      orbitals = es.eigenvectors();
+      occupations *= Tbase{-1};
+      for(Index k=0; k<occupations.size(); k++)
+        if(std::abs(occupations(k)) <= zero_tol)
+          occupations(k) = Tbase{0};
+    }
+
+    /// Throw unless every occupation in the block is non-negative to
+    /// within ``fail_tol``. Used where the density is a convex
+    /// combination and therefore must be positive semidefinite; a
+    /// violation there means the mixing coefficients left their
+    /// simplex, not that the eigensolver was noisy.
+    void require_nonnegative_occupations_(
+        const Vector<Tbase> & occupations, size_t iblock,
+        Tbase fail_tol) const {
+      if(occupations.minCoeff() < -fail_tol) {
+        std::ostringstream oss;
+        oss << "Negative natural occupation numbers in block " << iblock
+            << "!\n" << occupations;
+        throw std::logic_error(oss.str());
+      }
+    }
+
     /// Perform DIIS extrapolation of density matrix
     DensityMatrix<Torb, Tbase> extrapolate_density(const Vector<Tbase> & weights) const {
       if(weights.size() != (Index)orbital_history_.size()) {
@@ -1320,18 +1424,13 @@ namespace OpenOrbitalOptimizer {
           }
         }
 
-        // Flip the sign so that the orbitals come in increasing occupation
-        Matrix<Torb> neg_dm = -dm_block;
-        Eigen::SelfAdjointEigenSolver<Matrix<Torb>> es(neg_dm);
-        occupations[iblock] = es.eigenvalues();
-        orbitals[iblock] = es.eigenvectors();
-        occupations[iblock] *= Tbase{-1};
-        // Zero out numerically zero occupations
-        const Tbase zero_tol = 10*maximum_occupation_(iblock)*std::numeric_limits<Tbase>::epsilon();
-        for(Index k=0; k<occupations[iblock].size(); k++) {
-          if(std::abs(occupations[iblock][k]) <= zero_tol)
-            occupations[iblock][k] = Tbase{0};
-        }
+        // The extrapolation weights may be negative, so this is an
+        // affine and not a convex combination: negative natural
+        // occupations are legitimate here and are left alone.
+        const Tbase zero_tol = Tbase(10) * maximum_occupation_(iblock)
+                             * std::numeric_limits<Tbase>::epsilon();
+        natural_orbitals_(dm_block, zero_tol,
+                          orbitals[iblock], occupations[iblock]);
       }
 
       return std::make_pair(orbitals,occupations);
@@ -1615,15 +1714,10 @@ namespace OpenOrbitalOptimizer {
 
         size_t ifill=0;
         while(particles_left(num_left)) {
-          auto ienergy = std::get<0>(all_energies[ifill]);
-
           // Find end of this degenerate group
-          size_t jfill;
-          for(jfill=ifill+1; jfill < all_energies.size(); jfill++) {
-            auto jenergy = std::get<0>(all_energies[jfill]);
-            if(std::abs(ienergy-jenergy) > optimal_damping_degeneracy_threshold_)
-              break;
-          }
+          const size_t jfill = degenerate_cluster_end_(
+              ifill, all_energies.size(),
+              [&](size_t k) { return std::get<0>(all_energies[k]); });
 
           // Total capacity of the degenerate group
           Tbase maximum_capacity = Tbase(0);
@@ -1852,12 +1946,6 @@ namespace OpenOrbitalOptimizer {
                 new_orbitals[iblock], new_occ, maximum_occupation_(iblock));
             Matrix<Torb> mix_dm = (Tbase(1) - lambda_sum)*old_dm + new_dm;
 
-            mix_dm *= -Tbase(1);
-            Eigen::SelfAdjointEigenSolver<Matrix<Torb>> es(mix_dm);
-            interp_occs[iblock] = es.eigenvalues();
-            interp_orbs[iblock] = es.eigenvectors();
-            interp_occs[iblock] *= Tbase{-1};
-
             // Noise tolerances for the natural occupations. Both are
             // powers of epsilon so they stay tight in extended
             // precision, and both scale with the block's occupation
@@ -1874,20 +1962,20 @@ namespace OpenOrbitalOptimizer {
             // and are clamped to zero; the guard then fires only on
             // occupations negative enough to mean a genuinely corrupt
             // density (order 0.1), never on numerical noise.
+            //
+            // Unlike the DIIS extrapolation this *is* a convex
+            // combination -- lam_p was just projected onto its
+            // simplex -- so the mixed density must be positive
+            // semidefinite and the guard is meaningful.
             const Tbase eps_occ   = std::numeric_limits<Tbase>::epsilon();
             const Tbase occ_scale = std::max(Tbase(1), maximum_occupation_(iblock));
             const Tbase zero_tol  = std::sqrt(eps_occ) * occ_scale;
             const Tbase fail_tol  = std::sqrt(std::sqrt(eps_occ)) * occ_scale;
-            for(Index k=0; k<interp_occs[iblock].size(); k++) {
-              if(std::abs(interp_occs[iblock](k)) <= zero_tol)
-                interp_occs[iblock](k) = Tbase{0};
-            }
 
-            if(interp_occs[iblock].minCoeff() < -fail_tol) {
-              std::ostringstream oss;
-              oss << "Negative natural occupation numbers in block " << iblock << "!\n" << interp_occs[iblock];
-              throw std::logic_error(oss.str());
-            }
+            natural_orbitals_(mix_dm, zero_tol,
+                              interp_orbs[iblock], interp_occs[iblock]);
+            require_nonnegative_occupations_(interp_occs[iblock], iblock,
+                                             fail_tol);
           }
           iparam += ntrial;
         }
@@ -1903,27 +1991,6 @@ namespace OpenOrbitalOptimizer {
         return std::make_pair(dm, fock);
       };
 
-      // Compute tr(fock * (P(dm1) - P(dm2))) where P is built from orbitals * diag(occ) * orbitals^H
-      // Materialise a density matrix, per block, from its natural-
-      // orbital / occupation representation. Used to hoist the
-      // C * diag(n) * C^dagger builds out of the O(npars^2) Hessian
-      // loop so each vertex density is constructed once. Delegates
-      // to build_density_block_, which drops zero-occupation natural
-      // orbitals before the outer product.
-      auto materialise_density =
-          [this](const DensityMatrix<Torb,Tbase> & dm) {
-        const auto & orbitals = dm.first;
-        const auto & occupations = dm.second;
-        std::vector<Matrix<Torb>> blocks(orbitals.size());
-        for(size_t iblock=0; iblock<orbitals.size(); iblock++) {
-          if(empty_block(iblock)) continue;
-          blocks[iblock] = build_density_block_(
-              orbitals[iblock], occupations[iblock],
-              maximum_occupation_(iblock));
-        }
-        return blocks;
-      };
-
       // Trace of ``(D_a - D_b) F`` given pre-materialised density
       // blocks. Uses tr(A F) = sum_{ij} A(i,j) * F(j,i) evaluated as
       // an element-wise product sum -- O(N^2) instead of the O(N^3)
@@ -1937,9 +2004,7 @@ namespace OpenOrbitalOptimizer {
         for(size_t iblock=0; iblock<fock.size(); iblock++) {
           if(empty_block(iblock))
             continue;
-          const Matrix<Torb> dD = D_a[iblock] - D_b[iblock];
-          tr += std::real(
-              (dD.array() * fock[iblock].transpose().array()).sum());
+          tr += tr_of_product_(D_a[iblock] - D_b[iblock], fock[iblock]);
         }
         return tr;
       };
@@ -1985,10 +2050,10 @@ namespace OpenOrbitalOptimizer {
       // helper then does O(npars^2) elementwise-product traces on
       // those cached blocks rather than rebuilding a density matrix
       // per call.
-      const std::vector<Matrix<Torb>> D_orig = materialise_density(P_orig);
+      const std::vector<Matrix<Torb>> D_orig = build_density_blocks_(P_orig);
       std::vector<std::vector<Matrix<Torb>>> D_axis(npars);
       for(size_t i=0; i<npars; i++)
-        D_axis[i] = materialise_density(evaluations[i].first);
+        D_axis[i] = build_density_blocks_(evaluations[i].first);
 
       Vector<Tbase> grad(npars);
       for(size_t i=0; i<npars; i++)
@@ -2222,9 +2287,7 @@ namespace OpenOrbitalOptimizer {
         // achieved by the accepted initial trial-loop step. Refits
         // that squeeze at most one-tenth of the convergence threshold
         // out of it cannot change the outer SCF's stopping decision.
-        const Tbase refit_progress_tol =
-            Tbase(0.1) * std::max(convergence_threshold_,
-                                  noise_safety_factor_ * noise_floor_);
+        const Tbase refit_progress_tol = minimum_useful_descent_();
         for(int refit=0; refit < max_oda_refits_; refit++) {
           const auto & F_at_x = eval_accepted.second.second;
           Tbase E_at_x = eval_accepted.second.first;
@@ -2978,10 +3041,9 @@ namespace OpenOrbitalOptimizer {
     /// sitting entirely above that edge cannot participate in the next
     /// occupation update and are dropped.
     ///
-    /// Clusters use the same ODA-style "cluster from start" definition
-    /// as ``optimal_damping_step``: walking orbitals in energy order, a
-    /// cluster extends from its first orbital ``eps_start`` while
-    /// ``eps_k - eps_start < optimal_damping_degeneracy_threshold_``.
+    /// Clusters come from ``degenerate_cluster_end_``, the same walk
+    /// ``optimal_damping_step`` uses to build its skeleton sets, so
+    /// the burst is sized for exactly the clusters ODA created.
     /// A cluster contributes 1 iff its lowest energy sits at or below
     /// the window edge, it contains at least two orbitals, and the
     /// occupation spread inside it is at least
@@ -3086,18 +3148,17 @@ namespace OpenOrbitalOptimizer {
         // Walk sorted orbitals and identify ODA-style clusters.
         size_t start = 0;
         while(start < (size_t)n_b) {
-          Tbase eps_start = eps[b](order[start]);
-          size_t end = start;
-          while(end + 1 < (size_t)n_b
-                && eps[b](order[end + 1]) - eps_start
-                    < optimal_damping_degeneracy_threshold_)
-            end++;
+          const Tbase eps_start = eps[b](order[start]);
+          const size_t end = degenerate_cluster_end_(
+              start, (size_t)n_b,
+              [&](size_t k) { return eps[b](order[k]); });
 
-          // Skip clusters whose lowest energy is above the window edge.
-          if(eps_start <= edge && end > start) {
+          // Skip clusters whose lowest energy is above the window
+          // edge, and singletons, which carry no rotation pair.
+          if(eps_start <= edge && end - start >= 2) {
             Tbase min_n = n[b](order[start]);
-            Tbase max_n = n[b](order[start]);
-            for(size_t k = start + 1; k <= end; k++) {
+            Tbase max_n = min_n;
+            for(size_t k = start + 1; k < end; k++) {
               Tbase nk = n[b](order[k]);
               if(nk < min_n) min_n = nk;
               if(nk > max_n) max_n = nk;
@@ -3105,7 +3166,7 @@ namespace OpenOrbitalOptimizer {
             if(max_n - min_n >= occupation_change_threshold_)
               total++;
           }
-          start = end + 1;
+          start = end;
         }
       }
       return total;
@@ -3171,8 +3232,13 @@ namespace OpenOrbitalOptimizer {
       orbital_history_.clear();
       clear_diis_caches_();
 
-      // Reset number of evaluations
+      // Reset the per-run state. last_oda_via_collapsed_ matters:
+      // left set from an earlier run it would make the convergence-
+      // time full-polytope check fire on a run that never took a
+      // collapsed ODA step at all.
       number_of_fock_evaluations_ = 0;
+      last_oda_via_collapsed_ = false;
+      last_polytope_dimension_ = 0;
       add_entry(std::make_pair(orbitals, orbital_occupations));
 
       // Check that dimensions are consistent
@@ -3686,6 +3752,36 @@ namespace OpenOrbitalOptimizer {
       return (iparticle>0) ? number_of_blocks_per_particle_type_.head(iparticle).sum() : 0;
     }
 
+    /// Find the end of the near-degenerate orbital cluster starting
+    /// at index ``start`` in an energy-ascending list of ``n``
+    /// orbitals. The cluster is anchored on its first member: it
+    /// extends while ``energy(k) - energy(start) <=
+    /// optimal_damping_degeneracy_threshold_``. The return value is
+    /// one past the last member, so the cluster is the half-open
+    /// range ``[start, end)`` and is never empty.
+    ///
+    /// Anchoring on the first member rather than on the previous one
+    /// is what keeps the cluster width bounded by the threshold; a
+    /// pairwise-gap walk would chain arbitrarily far up a dense
+    /// ladder of orbitals.
+    ///
+    /// This is the single definition of "degenerate group" in the
+    /// solver. The ODA skeleton enumeration uses it to decide which
+    /// orbitals share a fractional filling, and the active-rotation
+    /// count uses it to size the post-ODA CG burst -- the latter has
+    /// to size the burst *for the clusters the former created*, so
+    /// the two must agree exactly, boundary included.
+    template<typename EnergyAt>
+    size_t degenerate_cluster_end_(size_t start, size_t n,
+                                   EnergyAt && energy_at) const {
+      const Tbase eps_start = energy_at(start);
+      size_t end = start + 1;
+      while(end < n && energy_at(end) - eps_start
+                         <= optimal_damping_degeneracy_threshold_)
+        end++;
+      return end;
+    }
+
     /// Collect orbital energies for a given particle type, sorted in
     /// increasing energy. Each tuple holds (energy, iblock, iorb).
     std::vector<std::tuple<Tbase, size_t, size_t>> order_orbitals_by_energy(const OrbitalEnergies<Tbase> & orbital_energies, size_t iparticle) const {
@@ -3771,9 +3867,8 @@ namespace OpenOrbitalOptimizer {
 
             return callback_convergence_function_(callback_data);
         } else {
-            Tbase effective = std::max(convergence_threshold_,
-                                       noise_safety_factor_ * noise_floor_);
-            return norm(diis_error_vector(0)) <= effective;
+            return norm(diis_error_vector(0))
+                <= effective_convergence_threshold_();
         }
     }
 
@@ -4032,9 +4127,7 @@ namespace OpenOrbitalOptimizer {
             const Tbase E_before = get_energy();
             const bool descended = optimal_damping_step(/*force_full=*/true);
             const Tbase actual_descent = E_before - get_energy();
-            const Tbase min_useful_descent = Tbase(1)/Tbase(10)
-                * std::max(convergence_threshold_,
-                           noise_safety_factor_ * noise_floor_);
+            const Tbase min_useful_descent = minimum_useful_descent_();
             if(descended && actual_descent > min_useful_descent) {
               log_(5, "Full-skeleton ODA found a %e Eh descent after "
                       "convergence; resuming SCF.\n", (double) (actual_descent));
