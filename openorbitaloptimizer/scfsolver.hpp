@@ -72,31 +72,6 @@ namespace OpenOrbitalOptimizer {
       return std::make_pair(x1, x2);
     }
 
-    /// Fit the quartic polynomial
-    ///   f(x) = a0 + a1*x + a2*x^2 + a3*x^3 + a4*x^4
-    /// to the Hermite data {f(0)=E0, f'(0)=dE0, f''(0)=d2E0,
-    /// f(x1)=E1, f'(x1)=dE1} -- five constraints for five coefficients.
-    /// Used along ODA polytope axes and pair-diagonal edges where the
-    /// diagonal (or projected) Hessian element gives a free quartic
-    /// data point without an additional Fock build.
-    template<typename T>
-    std::tuple<T,T,T,T,T> fit_quartic_polynomial_with_derivatives(
-        T E0, T dE0, T d2E0, T x1, T E1, T dE1) {
-      T a0 = E0;
-      T a1 = dE0;
-      T a2 = d2E0 / T(2);
-      T x1sq = x1 * x1;
-      T x1cu = x1sq * x1;
-      // Solve for a3, a4:
-      //   a3*x1^3 + a4*x1^4 = E1 - a0 - a1*x1 - a2*x1^2
-      //   3*a3*x1^2 + 4*a4*x1^3 = dE1 - a1 - 2*a2*x1
-      T r1 = E1 - a0 - a1 * x1 - a2 * x1sq;
-      T r2 = dE1 - a1 - T(2) * a2 * x1;
-      T a3 = (T(4) * r1 - x1 * r2) / x1cu;
-      T a4 = (x1 * r2 - T(3) * r1) / (x1cu * x1);
-      return std::make_tuple(a0, a1, a2, a3, a4);
-    }
-
     /// Evaluate a polynomial with the given coefficients (index i =
     /// coefficient of x^i) at ``x`` via Horner's scheme.
     template<typename T, size_t N>
@@ -105,38 +80,6 @@ namespace OpenOrbitalOptimizer {
       for (size_t i = N - 1; i-- > 0;)
         r = r * x + coeffs[i];
       return r;
-    }
-
-    /// Bisect for real roots of ``f`` in ``[x_lo, x_hi]`` by sampling
-    /// on a coarse grid and refining sign changes. Robust and free of
-    /// external polynomial-root dependencies. Used to locate the
-    /// stationary points of the quartic axis / edge fits, where the
-    /// derivative is a cubic.
-    template<typename T, class Fn>
-    std::vector<T> real_roots_in_interval(Fn && f, T x_lo, T x_hi,
-                                          int n_samples = 33) {
-      std::vector<T> roots;
-      T dx = (x_hi - x_lo) / T(n_samples - 1);
-      T x_prev = x_lo;
-      T y_prev = f(x_prev);
-      for (int i = 1; i < n_samples; i++) {
-        T x_cur = x_lo + T(i) * dx;
-        T y_cur = f(x_cur);
-        if ((y_prev >= T(0)) != (y_cur >= T(0))) {
-          T lo = x_prev, hi = x_cur;
-          T ylo = y_prev, yhi = y_cur;
-          for (int j = 0; j < 60; j++) {
-            T mid = (T(1)/T(2)) * (lo + hi);
-            T ymid = f(mid);
-            if ((ymid >= T(0)) == (ylo >= T(0))) { lo = mid; ylo = ymid; }
-            else                                 { hi = mid; yhi = ymid; }
-          }
-          roots.push_back((T(1)/T(2)) * (lo + hi));
-        }
-        x_prev = x_cur;
-        y_prev = y_cur;
-      }
-      return roots;
     }
 
   }
@@ -2038,16 +1981,31 @@ namespace OpenOrbitalOptimizer {
 
       // Candidate list: (lambda, tag, model-predicted energy at lambda).
       // The QP model gives one; along each 1D axis and each pair-
-      // diagonal edge we also fit a quartic Hermite polynomial through
-      // the two endpoint values, endpoint slopes, and the second
-      // derivative at lambda=0 taken from the analytic Hessian block
-      // (H_ii on an axis, d^T H d on an edge). That's exactly the
-      // five data points a quartic needs; no additional Fock builds
-      // beyond the npars axis vertices already evaluated. Roots of
-      // each 1D quartic's derivative inside (0,1) become candidates,
-      // scored by their own polynomial value at the root (the multi-
-      // dim quadratic underestimates 1D non-linearity along that
-      // direction).
+      // diagonal edge we also fit a cubic Hermite polynomial through
+      // the two endpoint energies and the two endpoint slopes. Those
+      // four data exactly determine a cubic and cost no Fock builds
+      // beyond the npars axis vertices already evaluated. Interior
+      // minima of each 1D cubic become candidates, scored by that
+      // polynomial's own value at the root (the multi-dimensional
+      // quadratic underestimates 1D non-linearity along the ray).
+      //
+      // A quartic is deliberately NOT used. Along a linear ray in
+      // density space the Hartree-Fock energy is exactly quadratic, so
+      // the cubic already carries a spare order for the
+      // exchange-correlation non-linearity. More to the point, no
+      // genuinely independent fifth datum is available for free:
+      //   * H_ii = 2 (E_1 - E_0 - g_0) is itself the Hermite quadratic
+      //     through the same three data, so imposing it makes the
+      //     quartic's residual vanish identically -- it adds nothing.
+      //   * E'(1) - E'(0) is a function of two constraints the fit
+      //     already carries; its residual equals -a3/2 of this very
+      //     cubic, i.e. the same information redistributed.
+      // Both would also form that residual as a difference of two
+      // total energies, so near convergence they amplify roundoff into
+      // spurious stationary points. A real fifth datum would need a
+      // midpoint energy (an extra Fock build per ray) or the
+      // exchange-correlation kernel, which the Fock-builder interface
+      // does not expose.
       struct Candidate {
         Vector<Tbase> lam;
         std::string tag;
@@ -2056,34 +2014,57 @@ namespace OpenOrbitalOptimizer {
       std::vector<Candidate> candidates;
       if(lam_opt.template lpNorm<Eigen::Infinity>() > 100*eps)
         candidates.push_back({lam_opt, "model min", model_min});
+
+      // Fit the cubic through (0, E0, dE0) and (1, E1, dE1) and emit a
+      // candidate at each interior minimum. ``place`` writes the root
+      // into the lambda vector for the ray being probed.
+      auto add_cubic_candidates =
+          [&](Tbase E0, Tbase dE0, Tbase E1, Tbase dE1,
+              const std::string & tag, auto && place) {
+        auto c = HelperRoutines::fit_cubic_polynomial_with_derivatives<Tbase>(
+                     E0, dE0, Tbase(1), E1, dE1);
+        std::pair<Tbase, Tbase> zeros;
+        try {
+          zeros = std::apply(HelperRoutines::cubic_polynomial_zeros<Tbase>, c);
+        } catch(std::logic_error &) {
+          return;   // constant derivative, or no real stationary point
+        }
+        const std::array<Tbase, 4> coeffs = {std::get<0>(c), std::get<1>(c),
+                                             std::get<2>(c), std::get<3>(c)};
+        bool emitted = false;
+        Tbase first_root = Tbase(0);
+        for(Tbase z : {zeros.first, zeros.second}) {
+          if(!(z > 100*eps && z < Tbase(1) - 100*eps))
+            continue;
+          // Keep minima only: f''(z) = 2 a2 + 6 a3 z > 0. The other
+          // root of the derivative is a maximum and is never a useful
+          // trial step. This is the same test the sigma line search
+          // applies to its cubic fits.
+          if(!(Tbase(2)*coeffs[2] + Tbase(6)*coeffs[3]*z > Tbase(0)))
+            continue;
+          // cubic_polynomial_zeros returns a doubled root when the
+          // cubic degenerates to a quadratic; do not emit it twice.
+          if(emitted && std::abs(z - first_root) <= 100*eps)
+            continue;
+          Vector<Tbase> xc = Vector<Tbase>::Zero(npars);
+          place(z, xc);
+          candidates.push_back({std::move(xc), tag,
+                                HelperRoutines::evaluate_polynomial<Tbase, 4>(coeffs, z)});
+          emitted = true;
+          first_root = z;
+        }
+      };
+
       for(size_t i=0; i<npars; i++) {
         Tbase E_i = evaluations[i].second.first;
         Tbase g_i = grad(i);
-        Tbase H_ii = hess(i, i);
         Tbase slope_at_1 = trace_diff(D_axis[i], D_orig, evaluations[i].second.second);
-        auto q = HelperRoutines::fit_quartic_polynomial_with_derivatives<Tbase>(
-            E_orig, g_i, H_ii, Tbase(1), E_i, slope_at_1);
-        std::array<Tbase, 5> coeffs = {std::get<0>(q), std::get<1>(q), std::get<2>(q),
-                                       std::get<3>(q), std::get<4>(q)};
-        // Derivative is a cubic (coefficients: a1, 2a2, 3a3, 4a4).
-        auto dpoly = [&](Tbase x) {
-          return coeffs[1] + x * (Tbase(2)*coeffs[2]
-                          + x * (Tbase(3)*coeffs[3] + x * Tbase(4)*coeffs[4]));
-        };
-        auto zeros = HelperRoutines::real_roots_in_interval<Tbase>(
-            dpoly, 100*eps, Tbase(1) - 100*eps);
-        for(Tbase z : zeros) {
-          Vector<Tbase> xc = Vector<Tbase>::Zero(npars);
-          xc(i) = z;
-          Tbase E_pred = HelperRoutines::evaluate_polynomial<Tbase, 5>(coeffs, z);
-          candidates.push_back({std::move(xc),
-                                std::string("quartic axis ") + std::to_string(i),
-                                E_pred});
-        }
+        add_cubic_candidates(E_orig, g_i, E_i, slope_at_1,
+                             std::string("cubic axis ") + std::to_string(i),
+                             [i](Tbase z, Vector<Tbase> & xc) { xc(i) = z; });
       }
-      // Pair-diagonal quartics along each edge from vertex e_i to
-      // vertex e_j. Direction d = e_j - e_i; the second derivative at
-      // t=0 in that direction is d^T H d = H_ii + H_jj - 2 H_ij.
+      // Pair-diagonal cubics along each edge from vertex e_i to vertex
+      // e_j, parameterised by t with lambda = (1-t) e_i + t e_j.
       for(size_t i=0; i<npars; i++) {
         for(size_t j=i+1; j<npars; j++) {
           const auto & F_i = evaluations[i].second.second;
@@ -2092,26 +2073,12 @@ namespace OpenOrbitalOptimizer {
           Tbase E_j = evaluations[j].second.first;
           Tbase slope_i = trace_diff(D_axis[j], D_axis[i], F_i);
           Tbase slope_j = trace_diff(D_axis[j], D_axis[i], F_j);
-          Tbase d2_along_edge = hess(i, i) + hess(j, j) - Tbase(2) * hess(i, j);
-          auto q = HelperRoutines::fit_quartic_polynomial_with_derivatives<Tbase>(
-              E_i, slope_i, d2_along_edge, Tbase(1), E_j, slope_j);
-          std::array<Tbase, 5> coeffs = {std::get<0>(q), std::get<1>(q), std::get<2>(q),
-                                         std::get<3>(q), std::get<4>(q)};
-          auto dpoly = [&](Tbase x) {
-            return coeffs[1] + x * (Tbase(2)*coeffs[2]
-                            + x * (Tbase(3)*coeffs[3] + x * Tbase(4)*coeffs[4]));
-          };
-          auto zeros = HelperRoutines::real_roots_in_interval<Tbase>(
-              dpoly, 100*eps, Tbase(1) - 100*eps);
-          for(Tbase z : zeros) {
-            Vector<Tbase> xc = Vector<Tbase>::Zero(npars);
-            xc(i) = Tbase(1) - z;
-            xc(j) = z;
-            Tbase E_pred = HelperRoutines::evaluate_polynomial<Tbase, 5>(coeffs, z);
-            candidates.push_back({std::move(xc),
-                                  std::string("quartic edge ") + std::to_string(i) + "-" + std::to_string(j),
-                                  E_pred});
-          }
+          add_cubic_candidates(E_i, slope_i, E_j, slope_j,
+                               std::string("cubic edge ") + std::to_string(i) + "-" + std::to_string(j),
+                               [i,j](Tbase z, Vector<Tbase> & xc) {
+                                 xc(i) = Tbase(1) - z;
+                                 xc(j) = z;
+                               });
         }
       }
 
@@ -2131,11 +2098,11 @@ namespace OpenOrbitalOptimizer {
         size_t n_model = 0, n_axis = 0, n_edge = 0;
         for(const auto & cand : candidates) {
           if(cand.tag == "model min") n_model++;
-          else if(cand.tag.rfind("quartic axis", 0) == 0) n_axis++;
-          else if(cand.tag.rfind("quartic edge", 0) == 0) n_edge++;
+          else if(cand.tag.rfind("cubic axis", 0) == 0) n_axis++;
+          else if(cand.tag.rfind("cubic edge", 0) == 0) n_edge++;
         }
         log_(5, "Trial loop: %zu candidates (%zu quadratic-model + "
-               "%zu quartic-axis + %zu quartic-edge); ordered by "
+               "%zu cubic-axis + %zu cubic-edge); ordered by "
                "predicted energy so the first Fock build usually "
                "lands the ODA step.\n",
                candidates.size(), n_model, n_axis, n_edge);

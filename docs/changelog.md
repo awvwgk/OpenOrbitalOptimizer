@@ -127,8 +127,8 @@
   is below noise, so idle refits cost nothing on well-conditioned
   problems.
 * ODA candidate selection is now model-first. The polytope
-  quadratic-model minimum and the 1D probes (quartic per axis,
-  quartic per pair-diagonal edge) are ranked by their
+  quadratic-model minimum and the 1D cubic Hermite probes (one per
+  axis, one per pair-diagonal edge) are ranked by their
   polynomial-predicted energy, and the trial loop evaluates them in
   that order. Along a linear ray in density space the Hartree-Fock
   energy is exactly quadratic and the polynomial fits are exact for
@@ -136,12 +136,11 @@
   first candidate is normally the accepted step -- one Fock build
   per ODA call in place of the worst-case
   O(candidates × backoff scales) sweep.
-* Promoted the axis and edge 1D probes from cubic to quartic
-  Hermite. The diagonal Hessian block `H_ii` (on an axis) and the
-  edge-projected Hessian `H_ii + H_jj - 2 H_ij` (on a pair-diagonal
-  edge) supply the fifth Hermite data point at zero additional Fock
-  cost, so the quartic captures DFT non-quadraticity that the
-  earlier cubic missed.
+* The 1D probes emit only interior *minima* of the fitted cubic
+  (the second root of the derivative is a maximum and is never a
+  useful trial step), and de-duplicate the doubled root returned
+  when the cubic degenerates to a quadratic. Axis and edge probes
+  now share one fitting routine.
 
 #### New Features (continued)
 * Route all library log output through a caller-installable
