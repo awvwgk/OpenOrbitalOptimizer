@@ -257,12 +257,56 @@
       triggers only on occupations negative enough to mean a
       genuinely corrupt density, and the thresholds still tighten
       automatically in ``__float128``.
+* ``initialize_with_orbitals`` now resets ``last_oda_via_collapsed_``
+  and ``last_polytope_dimension_`` along with the rest of the
+  per-run state. Left set from an earlier run on the same solver,
+  the former made the convergence-time full-polytope check fire on
+  a run that never took a collapsed ODA step.
+* The degenerate-cluster walk had two implementations with opposite
+  boundaries: the ODA skeleton enumeration included an orbital
+  exactly one threshold away from the cluster start, the
+  active-rotation count excluded it. The latter sizes the post-ODA
+  CG burst *for the clusters the former creates*, and its docstring
+  already claimed the two definitions were identical. Both now go
+  through one ``degenerate_cluster_end_``, on the ODA boundary.
 * Corrected the ADIIS linear-term docstring: the loop actually
   computes ``2 * <D_i - D_0 | F_0>`` (the standard ADIIS model of
   Hu & Yang, JCP 132, 054109), not ``2 * <D_i - D_0 | F_i - F_0>``
   as the old comment claimed. Computation itself is unchanged.
 
 #### Misc.
+* Gave each duplicated concept in ``scfsolver.hpp`` a single
+  definition. No behaviour change; energies are bit-identical on
+  both the ODA and the DIIS paths.
+    - The effective convergence threshold had three spellings, two
+      of them the same quantity written ``Tbase(0.1)`` and
+      ``Tbase(1)/Tbase(10)``. Now
+      ``effective_convergence_threshold_()`` and
+      ``minimum_useful_descent_()``, which also retires the last
+      bare fractional literal in the file.
+    - The natural-orbital re-diagonalisation had two copies that had
+      already drifted. The drift turns out to be *correct* and is
+      now documented rather than removed: ODA mixes convexly, so its
+      result must be positive semidefinite, while DIIS extrapolates
+      affinely with weights that may be negative, so negative
+      occupations are a normal outcome there. ``natural_orbitals_``
+      shares the mechanics and takes the noise tolerance as an
+      argument; ``require_nonnegative_occupations_`` is the opt-in
+      guard. Its doc comment also claimed the sign flip yields
+      *increasing* occupations — it yields decreasing ones, which is
+      both the convention and what the code wants.
+    - The active-natural-orbital extraction (count, allocate, fill,
+      tolerance ``10 * max_occ * eps``) was open-coded in both the
+      rank-k density build and the rank-k commutator build. Now
+      ``active_natural_orbitals_``.
+    - ``trace_diff`` open-coded the O(N^2) elementwise trace
+      ``tr_of_product_`` already provides, and ``materialise_density``
+      was an ODA-local lambda doing per block what
+      ``build_density_block_`` does; it is now the member
+      ``build_density_blocks_``.
+    - The 449-line body of the ODA ``attempts`` loop was never
+      re-indented when the loop was wrapped around it. Whitespace
+      only — ``git diff -w`` on that commit is empty.
 * Bare ``double`` literals in ``scfsolver.hpp`` arithmetic sites
   (0.0, 1.0, 2.0, 10.0, 100.0, -1.0; 45 occurrences) wrapped in
   ``Tbase(N)``, so ``float`` and ``__float128`` instantiations no
