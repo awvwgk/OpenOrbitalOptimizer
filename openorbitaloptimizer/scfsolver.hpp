@@ -1884,480 +1884,480 @@ namespace OpenOrbitalOptimizer {
             (iattempt == 0 && attempts.size() > 1);
         if(iattempt > 0)
           log_(5, "Collapsed polytope did not descend; retrying with full skeleton set.\n");
-      size_t npars = 0;
-      for(auto & trial: trial_occupations_per_particle)
-        npars += trial.size();
-      // Record the polytope dimension so the outer SCF state machine
-      // can size its post-ODA orbital-rotation burst when the user has not overridden
-      // orbital_rotation_steps_after_oda_.
-      last_polytope_dimension_ = npars;
-      log_(5, "%i parameters in optimal damping (attempt %s)\n", (int) npars,
-           attempts.size() > 1
-             ? (iattempt == 0 ? "collapsed" : "full")
-             : "full");
-      log_flush_();
-      if(npars==0)
-        continue;
+        size_t npars = 0;
+        for(auto & trial: trial_occupations_per_particle)
+          npars += trial.size();
+        // Record the polytope dimension so the outer SCF state machine
+        // can size its post-ODA orbital-rotation burst when the user has not overridden
+        // orbital_rotation_steps_after_oda_.
+        last_polytope_dimension_ = npars;
+        log_(5, "%i parameters in optimal damping (attempt %s)\n", (int) npars,
+             attempts.size() > 1
+               ? (iattempt == 0 ? "collapsed" : "full")
+               : "full");
+        log_flush_();
+        if(npars==0)
+          continue;
 
-      // Build mixed density from a parameter vector lambda. Per
-      // particle type, the lambda subvector has one entry per skeleton;
-      // the residual (1 - sum) goes to the reference density.
-      auto interpolate_density = [this, &reference_orbitals, &reference_occupations, &new_orbitals, &trial_occupations_per_particle](const Vector<Tbase> & lambda) {
-        Orbitals<Torb> interp_orbs(reference_orbitals.size());
-        OrbitalOccupations<Tbase> interp_occs(reference_orbitals.size());
+        // Build mixed density from a parameter vector lambda. Per
+        // particle type, the lambda subvector has one entry per skeleton;
+        // the residual (1 - sum) goes to the reference density.
+        auto interpolate_density = [this, &reference_orbitals, &reference_occupations, &new_orbitals, &trial_occupations_per_particle](const Vector<Tbase> & lambda) {
+          Orbitals<Torb> interp_orbs(reference_orbitals.size());
+          OrbitalOccupations<Tbase> interp_occs(reference_orbitals.size());
 
-        size_t iparam=0;
-        for(Index iparticle=0; iparticle<number_of_blocks_per_particle_type_.size(); iparticle++) {
-          size_t ntrial = trial_occupations_per_particle[iparticle].size();
-          if(ntrial==0)
-            continue;
-          // Project this particle's lambda block onto its simplex
-          // {lambda >= 0, sum(lambda) <= 1} before using it.
-          //
-          // The QP solver enforces that simplex only to the accuracy
-          // of its constrained linear solve, so an ill-conditioned
-          // reduced Hessian -- exactly what a starting density
-          // projected between two different basis sets produces --
-          // can leave sum(lambda) above 1 by of order cond * eps.
-          // Any overshoot hands old_dm a negative weight and makes
-          // the mixed density non-positive-semidefinite, which then
-          // surfaces far downstream as a negative natural occupation.
-          // Nothing in the algorithm wants lambda outside the
-          // simplex: the trial loop only ever scales candidates
-          // *down*, so clamping here loses no intended step.
-          Vector<Tbase> lam_p = lambda.segment(iparam, ntrial);
-          HelperRoutines::project_onto_unit_simplex<Tbase>(lam_p);
-          const Tbase lambda_sum = lam_p.sum();
+          size_t iparam=0;
+          for(Index iparticle=0; iparticle<number_of_blocks_per_particle_type_.size(); iparticle++) {
+            size_t ntrial = trial_occupations_per_particle[iparticle].size();
+            if(ntrial==0)
+              continue;
+            // Project this particle's lambda block onto its simplex
+            // {lambda >= 0, sum(lambda) <= 1} before using it.
+            //
+            // The QP solver enforces that simplex only to the accuracy
+            // of its constrained linear solve, so an ill-conditioned
+            // reduced Hessian -- exactly what a starting density
+            // projected between two different basis sets produces --
+            // can leave sum(lambda) above 1 by of order cond * eps.
+            // Any overshoot hands old_dm a negative weight and makes
+            // the mixed density non-positive-semidefinite, which then
+            // surfaces far downstream as a negative natural occupation.
+            // Nothing in the algorithm wants lambda outside the
+            // simplex: the trial loop only ever scales candidates
+            // *down*, so clamping here loses no intended step.
+            Vector<Tbase> lam_p = lambda.segment(iparam, ntrial);
+            HelperRoutines::project_onto_unit_simplex<Tbase>(lam_p);
+            const Tbase lambda_sum = lam_p.sum();
 
-          for(size_t iblock_particle = 0; iblock_particle < (size_t)number_of_blocks_per_particle_type_(iparticle); iblock_particle++) {
-            size_t iblock = iblock_particle + particle_block_offset(iparticle);
+            for(size_t iblock_particle = 0; iblock_particle < (size_t)number_of_blocks_per_particle_type_(iparticle); iblock_particle++) {
+              size_t iblock = iblock_particle + particle_block_offset(iparticle);
+              if(empty_block(iblock))
+                continue;
+
+              Matrix<Torb> old_dm = build_density_block_(
+                  reference_orbitals[iblock], reference_occupations[iblock],
+                  maximum_occupation_(iblock));
+
+              Vector<Tbase> new_occ = lam_p(0)*trial_occupations_per_particle[iparticle][0][iblock_particle];
+              for(size_t itrial=1; itrial<ntrial; itrial++)
+                new_occ += lam_p(itrial)*trial_occupations_per_particle[iparticle][itrial][iblock_particle];
+
+              Matrix<Torb> new_dm = build_density_block_(
+                  new_orbitals[iblock], new_occ, maximum_occupation_(iblock));
+              Matrix<Torb> mix_dm = (Tbase(1) - lambda_sum)*old_dm + new_dm;
+
+              // Noise tolerances for the natural occupations. Both are
+              // powers of epsilon so they stay tight in extended
+              // precision, and both scale with the block's occupation
+              // magnitude.
+              //
+              // An absolute multiple of epsilon is right for a density
+              // that was just built, but far too tight for one that has
+              // been projected between basis sets and then mixed: the
+              // eigendecomposition of such a matrix carries error of
+              // order cond * eps, which can be thousands of epsilons.
+              //   zero_tol = sqrt(eps)      ~ 1.5e-8 (double), 1e-17 (quad)
+              //   fail_tol = eps^(1/4)      ~ 1.2e-4 (double), 1e-8  (quad)
+              // Occupations below zero_tol are chemically meaningless
+              // and are clamped to zero; the guard then fires only on
+              // occupations negative enough to mean a genuinely corrupt
+              // density (order 0.1), never on numerical noise.
+              //
+              // Unlike the DIIS extrapolation this *is* a convex
+              // combination -- lam_p was just projected onto its
+              // simplex -- so the mixed density must be positive
+              // semidefinite and the guard is meaningful.
+              const Tbase eps_occ   = std::numeric_limits<Tbase>::epsilon();
+              const Tbase occ_scale = std::max(Tbase(1), maximum_occupation_(iblock));
+              const Tbase zero_tol  = std::sqrt(eps_occ) * occ_scale;
+              const Tbase fail_tol  = std::sqrt(std::sqrt(eps_occ)) * occ_scale;
+
+              natural_orbitals_(mix_dm, zero_tol,
+                                interp_orbs[iblock], interp_occs[iblock]);
+              require_nonnegative_occupations_(interp_occs[iblock], iblock,
+                                               fail_tol);
+            }
+            iparam += ntrial;
+          }
+          if(iparam != (size_t)lambda.size())
+            throw std::logic_error("Indexing inconsistency in optimal_damping_step\n");
+
+          return std::make_pair(interp_orbs, interp_occs);
+        };
+
+        auto evaluate = [this, &interpolate_density](const Vector<Tbase> & lambda) {
+          auto dm = interpolate_density(lambda);
+          auto fock = fock_builder_(dm);
+          return std::make_pair(dm, fock);
+        };
+
+        // Trace of ``(D_a - D_b) F`` given pre-materialised density
+        // blocks. Uses tr(A F) = sum_{ij} A(i,j) * F(j,i) evaluated as
+        // an element-wise product sum -- O(N^2) instead of the O(N^3)
+        // matmul-then-trace form. Combined with the pre-materialised
+        // density blocks this collapses the axis-Hessian construction
+        // from O(npars^2 * N^3) to O(npars * N^3 + npars^2 * N^2).
+        auto trace_diff = [this](const std::vector<Matrix<Torb>> & D_a,
+                                 const std::vector<Matrix<Torb>> & D_b,
+                                 const FockMatrix<Torb> & fock) {
+          Tbase tr = Tbase(0);
+          for(size_t iblock=0; iblock<fock.size(); iblock++) {
             if(empty_block(iblock))
               continue;
-
-            Matrix<Torb> old_dm = build_density_block_(
-                reference_orbitals[iblock], reference_occupations[iblock],
-                maximum_occupation_(iblock));
-
-            Vector<Tbase> new_occ = lam_p(0)*trial_occupations_per_particle[iparticle][0][iblock_particle];
-            for(size_t itrial=1; itrial<ntrial; itrial++)
-              new_occ += lam_p(itrial)*trial_occupations_per_particle[iparticle][itrial][iblock_particle];
-
-            Matrix<Torb> new_dm = build_density_block_(
-                new_orbitals[iblock], new_occ, maximum_occupation_(iblock));
-            Matrix<Torb> mix_dm = (Tbase(1) - lambda_sum)*old_dm + new_dm;
-
-            // Noise tolerances for the natural occupations. Both are
-            // powers of epsilon so they stay tight in extended
-            // precision, and both scale with the block's occupation
-            // magnitude.
-            //
-            // An absolute multiple of epsilon is right for a density
-            // that was just built, but far too tight for one that has
-            // been projected between basis sets and then mixed: the
-            // eigendecomposition of such a matrix carries error of
-            // order cond * eps, which can be thousands of epsilons.
-            //   zero_tol = sqrt(eps)      ~ 1.5e-8 (double), 1e-17 (quad)
-            //   fail_tol = eps^(1/4)      ~ 1.2e-4 (double), 1e-8  (quad)
-            // Occupations below zero_tol are chemically meaningless
-            // and are clamped to zero; the guard then fires only on
-            // occupations negative enough to mean a genuinely corrupt
-            // density (order 0.1), never on numerical noise.
-            //
-            // Unlike the DIIS extrapolation this *is* a convex
-            // combination -- lam_p was just projected onto its
-            // simplex -- so the mixed density must be positive
-            // semidefinite and the guard is meaningful.
-            const Tbase eps_occ   = std::numeric_limits<Tbase>::epsilon();
-            const Tbase occ_scale = std::max(Tbase(1), maximum_occupation_(iblock));
-            const Tbase zero_tol  = std::sqrt(eps_occ) * occ_scale;
-            const Tbase fail_tol  = std::sqrt(std::sqrt(eps_occ)) * occ_scale;
-
-            natural_orbitals_(mix_dm, zero_tol,
-                              interp_orbs[iblock], interp_occs[iblock]);
-            require_nonnegative_occupations_(interp_occs[iblock], iblock,
-                                             fail_tol);
+            tr += tr_of_product_(D_a[iblock] - D_b[iblock], fock[iblock]);
           }
-          iparam += ntrial;
+          return tr;
+        };
+
+        Vector<Tbase> x0 = Vector<Tbase>::Zero(npars);
+        const Tbase E_orig = reference_energy;
+        const auto & F_orig = reference_fock;
+        const DensityMatrix<Torb,Tbase> P_orig = std::make_pair(reference_orbitals, reference_occupations);
+
+        // Evaluate each canonical vertex (one lambda_i = 1, others 0).
+        // The axis-vertex densities all share the same orbitals
+        // (new_orbitals) and differ only in their occupation vectors,
+        // so they go through the batched Fock-builder helper which the
+        // caller can override to amortise integral / grid setup.
+        std::vector<DensityMatrix<Torb,Tbase>> axis_densities(npars);
+        for(size_t idim=0; idim<npars; idim++) {
+          x0.setZero();
+          x0(idim) = Tbase(1);
+          axis_densities[idim] = interpolate_density(x0);
         }
-        if(iparam != (size_t)lambda.size())
-          throw std::logic_error("Indexing inconsistency in optimal_damping_step\n");
+        auto axis_fock = evaluate_batch_(axis_densities);
 
-        return std::make_pair(interp_orbs, interp_occs);
-      };
-
-      auto evaluate = [this, &interpolate_density](const Vector<Tbase> & lambda) {
-        auto dm = interpolate_density(lambda);
-        auto fock = fock_builder_(dm);
-        return std::make_pair(dm, fock);
-      };
-
-      // Trace of ``(D_a - D_b) F`` given pre-materialised density
-      // blocks. Uses tr(A F) = sum_{ij} A(i,j) * F(j,i) evaluated as
-      // an element-wise product sum -- O(N^2) instead of the O(N^3)
-      // matmul-then-trace form. Combined with the pre-materialised
-      // density blocks this collapses the axis-Hessian construction
-      // from O(npars^2 * N^3) to O(npars * N^3 + npars^2 * N^2).
-      auto trace_diff = [this](const std::vector<Matrix<Torb>> & D_a,
-                               const std::vector<Matrix<Torb>> & D_b,
-                               const FockMatrix<Torb> & fock) {
-        Tbase tr = Tbase(0);
-        for(size_t iblock=0; iblock<fock.size(); iblock++) {
-          if(empty_block(iblock))
-            continue;
-          tr += tr_of_product_(D_a[iblock] - D_b[iblock], fock[iblock]);
+        std::vector<std::pair<DensityMatrix<Torb,Tbase>,FockBuilderReturn<Torb,Tbase>>> evaluations(npars);
+        for(size_t idim=0; idim<npars; idim++) {
+          evaluations[idim] = std::make_pair(std::move(axis_densities[idim]),
+                                             std::move(axis_fock[idim]));
+          log_(5, "Roothaan step in dimension %i yields energy % .10f change %e\n",
+                 (int) idim, (double) (evaluations[idim].second.first), (double) (evaluations[idim].second.first - E_orig));
         }
-        return tr;
-      };
 
-      Vector<Tbase> x0 = Vector<Tbase>::Zero(npars);
-      const Tbase E_orig = reference_energy;
-      const auto & F_orig = reference_fock;
-      const DensityMatrix<Torb,Tbase> P_orig = std::make_pair(reference_orbitals, reference_occupations);
+        // Build a second-order Taylor model of the energy on the product
+        // of per-particle simplices around lambda = 0:
+        //   E(lambda) ~= E_orig + g^T lambda + 0.5 lambda^T H lambda.
+        // Gradient: g_i = tr(F_orig * (P_i - P_orig)).
+        // Diagonal Hessian: H_ii = 2*(E_i - E_orig - g_i), the Hermite
+        //   quadratic fit through (0, E_orig, g_i) and (1, E_i).
+        // Off-diagonal Hessian: H_ij ~= tr((F_j - F_orig) * (P_i - P_orig)),
+        //   exact when the energy is quadratic in P (Hartree-Fock) and a
+        //   second-order finite difference otherwise; symmetrized over (i,j).
+        // No additional Fock evaluations beyond the npars axis vertices.
+        //
+        // Materialise D_orig and each D_axis[i] once; the trace-diff
+        // helper then does O(npars^2) elementwise-product traces on
+        // those cached blocks rather than rebuilding a density matrix
+        // per call.
+        const std::vector<Matrix<Torb>> D_orig = build_density_blocks_(P_orig);
+        std::vector<std::vector<Matrix<Torb>>> D_axis(npars);
+        for(size_t i=0; i<npars; i++)
+          D_axis[i] = build_density_blocks_(evaluations[i].first);
 
-      // Evaluate each canonical vertex (one lambda_i = 1, others 0).
-      // The axis-vertex densities all share the same orbitals
-      // (new_orbitals) and differ only in their occupation vectors,
-      // so they go through the batched Fock-builder helper which the
-      // caller can override to amortise integral / grid setup.
-      std::vector<DensityMatrix<Torb,Tbase>> axis_densities(npars);
-      for(size_t idim=0; idim<npars; idim++) {
-        x0.setZero();
-        x0(idim) = Tbase(1);
-        axis_densities[idim] = interpolate_density(x0);
-      }
-      auto axis_fock = evaluate_batch_(axis_densities);
-
-      std::vector<std::pair<DensityMatrix<Torb,Tbase>,FockBuilderReturn<Torb,Tbase>>> evaluations(npars);
-      for(size_t idim=0; idim<npars; idim++) {
-        evaluations[idim] = std::make_pair(std::move(axis_densities[idim]),
-                                           std::move(axis_fock[idim]));
-        log_(5, "Roothaan step in dimension %i yields energy % .10f change %e\n",
-               (int) idim, (double) (evaluations[idim].second.first), (double) (evaluations[idim].second.first - E_orig));
-      }
-
-      // Build a second-order Taylor model of the energy on the product
-      // of per-particle simplices around lambda = 0:
-      //   E(lambda) ~= E_orig + g^T lambda + 0.5 lambda^T H lambda.
-      // Gradient: g_i = tr(F_orig * (P_i - P_orig)).
-      // Diagonal Hessian: H_ii = 2*(E_i - E_orig - g_i), the Hermite
-      //   quadratic fit through (0, E_orig, g_i) and (1, E_i).
-      // Off-diagonal Hessian: H_ij ~= tr((F_j - F_orig) * (P_i - P_orig)),
-      //   exact when the energy is quadratic in P (Hartree-Fock) and a
-      //   second-order finite difference otherwise; symmetrized over (i,j).
-      // No additional Fock evaluations beyond the npars axis vertices.
-      //
-      // Materialise D_orig and each D_axis[i] once; the trace-diff
-      // helper then does O(npars^2) elementwise-product traces on
-      // those cached blocks rather than rebuilding a density matrix
-      // per call.
-      const std::vector<Matrix<Torb>> D_orig = build_density_blocks_(P_orig);
-      std::vector<std::vector<Matrix<Torb>>> D_axis(npars);
-      for(size_t i=0; i<npars; i++)
-        D_axis[i] = build_density_blocks_(evaluations[i].first);
-
-      Vector<Tbase> grad(npars);
-      for(size_t i=0; i<npars; i++)
-        grad(i) = trace_diff(D_axis[i], D_orig, F_orig);
-      Matrix<Tbase> hess(npars, npars);
-      for(size_t i=0; i<npars; i++) {
-        Tbase E_i = evaluations[i].second.first;
-        hess(i, i) = 2*(E_i - E_orig - grad(i));
-        for(size_t j=i+1; j<npars; j++) {
-          const auto & F_j = evaluations[j].second.second;
-          const auto & F_i = evaluations[i].second.second;
-          Tbase from_j = trace_diff(D_axis[i], D_orig, F_j) - grad(i);
-          Tbase from_i = trace_diff(D_axis[j], D_orig, F_i) - grad(j);
-          hess(i, j) = (Tbase(1)/Tbase(2))*(from_j + from_i);
-          hess(j, i) = hess(i, j);
-        }
-      }
-
-      // Particle layout for the polytope: each active particle's lambda
-      // sub-vector lives on its own simplex {lambda >= 0, sum(lambda) <= 1}.
-      std::vector<size_t> particle_off, particle_len;
-      {
-        size_t off = 0;
-        for(Index p=0; p<number_of_blocks_per_particle_type_.size(); p++) {
-          size_t nt = trial_occupations_per_particle[p].size();
-          if(nt > 0) {
-            particle_off.push_back(off);
-            particle_len.push_back(nt);
-          }
-          off += nt;
-        }
-      }
-      // Minimise the quadratic model on the product-of-simplices
-      // polytope via the active-set QP solver. The previous code
-      // enumerated every face of the polytope (product over particles
-      // of 2^(n_p+1)-1 faces), which is intractable when degenerate
-      // groups span several blocks and produce npars in the tens.
-      const Tbase eps = std::numeric_limits<Tbase>::epsilon();
-      auto model_value = [&](const Vector<Tbase> & lam) {
-        return E_orig + grad.dot(lam) + (Tbase(1)/Tbase(2))*(lam.transpose()*hess*lam).value();
-      };
-      (void) model_value;
-      Vector<Tbase> lam_opt;
-      Tbase model_min;
-      std::tie(lam_opt, model_min) = solve_polytope_qp_(
-          hess, grad, E_orig, particle_off, particle_len);
-      log_(5, "Quadratic model minimum at lambda = (");
-      for(Index i=0; i<lam_opt.size(); i++)
-        log_(5, "%s%g", i ? "," : "", (double) (lam_opt(i)));
-      log_(5, "), model energy change %e\n", (double) (model_min - E_orig));
-
-      // Candidate list: (lambda, tag, model-predicted energy at lambda).
-      // The QP model gives one; along each 1D axis and each pair-
-      // diagonal edge we also fit a cubic Hermite polynomial through
-      // the two endpoint energies and the two endpoint slopes. Those
-      // four data exactly determine a cubic and cost no Fock builds
-      // beyond the npars axis vertices already evaluated. Interior
-      // minima of each 1D cubic become candidates, scored by that
-      // polynomial's own value at the root (the multi-dimensional
-      // quadratic underestimates 1D non-linearity along the ray).
-      //
-      // A quartic is deliberately NOT used. Along a linear ray in
-      // density space the Hartree-Fock energy is exactly quadratic, so
-      // the cubic already carries a spare order for the
-      // exchange-correlation non-linearity. More to the point, no
-      // genuinely independent fifth datum is available for free:
-      //   * H_ii = 2 (E_1 - E_0 - g_0) is itself the Hermite quadratic
-      //     through the same three data, so imposing it makes the
-      //     quartic's residual vanish identically -- it adds nothing.
-      //   * E'(1) - E'(0) is a function of two constraints the fit
-      //     already carries; its residual equals -a3/2 of this very
-      //     cubic, i.e. the same information redistributed.
-      // Both would also form that residual as a difference of two
-      // total energies, so near convergence they amplify roundoff into
-      // spurious stationary points. A real fifth datum would need a
-      // midpoint energy (an extra Fock build per ray) or the
-      // exchange-correlation kernel, which the Fock-builder interface
-      // does not expose.
-      struct Candidate {
-        Vector<Tbase> lam;
-        std::string tag;
-        Tbase model_score;
-      };
-      std::vector<Candidate> candidates;
-      if(lam_opt.template lpNorm<Eigen::Infinity>() > 100*eps)
-        candidates.push_back({lam_opt, "model min", model_min});
-
-      // Fit the cubic through (0, E0, dE0) and (1, E1, dE1) and emit a
-      // candidate at each interior minimum. ``place`` writes the root
-      // into the lambda vector for the ray being probed.
-      auto add_cubic_candidates =
-          [&](Tbase E0, Tbase dE0, Tbase E1, Tbase dE1,
-              const std::string & tag, auto && place) {
-        auto c = HelperRoutines::fit_cubic_polynomial_with_derivatives<Tbase>(
-                     E0, dE0, Tbase(1), E1, dE1);
-        std::pair<Tbase, Tbase> zeros;
-        try {
-          zeros = std::apply(HelperRoutines::cubic_polynomial_zeros<Tbase>, c);
-        } catch(std::logic_error &) {
-          return;   // constant derivative, or no real stationary point
-        }
-        const std::array<Tbase, 4> coeffs = {std::get<0>(c), std::get<1>(c),
-                                             std::get<2>(c), std::get<3>(c)};
-        bool emitted = false;
-        Tbase first_root = Tbase(0);
-        for(Tbase z : {zeros.first, zeros.second}) {
-          if(!(z > 100*eps && z < Tbase(1) - 100*eps))
-            continue;
-          // Keep minima only: f''(z) = 2 a2 + 6 a3 z > 0. The other
-          // root of the derivative is a maximum and is never a useful
-          // trial step. This is the same test the sigma line search
-          // applies to its cubic fits.
-          if(!(Tbase(2)*coeffs[2] + Tbase(6)*coeffs[3]*z > Tbase(0)))
-            continue;
-          // cubic_polynomial_zeros returns a doubled root when the
-          // cubic degenerates to a quadratic; do not emit it twice.
-          if(emitted && std::abs(z - first_root) <= 100*eps)
-            continue;
-          Vector<Tbase> xc = Vector<Tbase>::Zero(npars);
-          place(z, xc);
-          candidates.push_back({std::move(xc), tag,
-                                HelperRoutines::evaluate_polynomial<Tbase, 4>(coeffs, z)});
-          emitted = true;
-          first_root = z;
-        }
-      };
-
-      for(size_t i=0; i<npars; i++) {
-        Tbase E_i = evaluations[i].second.first;
-        Tbase g_i = grad(i);
-        Tbase slope_at_1 = trace_diff(D_axis[i], D_orig, evaluations[i].second.second);
-        add_cubic_candidates(E_orig, g_i, E_i, slope_at_1,
-                             std::string("cubic axis ") + std::to_string(i),
-                             [i](Tbase z, Vector<Tbase> & xc) { xc(i) = z; });
-      }
-      // Pair-diagonal cubics along each edge from vertex e_i to vertex
-      // e_j, parameterised by t with lambda = (1-t) e_i + t e_j.
-      for(size_t i=0; i<npars; i++) {
-        for(size_t j=i+1; j<npars; j++) {
-          const auto & F_i = evaluations[i].second.second;
-          const auto & F_j = evaluations[j].second.second;
+        Vector<Tbase> grad(npars);
+        for(size_t i=0; i<npars; i++)
+          grad(i) = trace_diff(D_axis[i], D_orig, F_orig);
+        Matrix<Tbase> hess(npars, npars);
+        for(size_t i=0; i<npars; i++) {
           Tbase E_i = evaluations[i].second.first;
-          Tbase E_j = evaluations[j].second.first;
-          Tbase slope_i = trace_diff(D_axis[j], D_axis[i], F_i);
-          Tbase slope_j = trace_diff(D_axis[j], D_axis[i], F_j);
-          add_cubic_candidates(E_i, slope_i, E_j, slope_j,
-                               std::string("cubic edge ") + std::to_string(i) + "-" + std::to_string(j),
-                               [i,j](Tbase z, Vector<Tbase> & xc) {
-                                 xc(i) = Tbase(1) - z;
-                                 xc(j) = z;
-                               });
-        }
-      }
-
-      // Rank candidates by their model-predicted energy so the trial
-      // loop tries the most-promising step first. For HF the model
-      // is exact along any linear ray, so the top candidate is the
-      // true minimum and a single Fock build lands the ODA step; for
-      // DFT the ordering is still an accurate heuristic near
-      // convergence, cutting the trial loop from O(N) Fock builds to
-      // one whenever the model doesn't lie.
-      std::sort(candidates.begin(), candidates.end(),
-                [](const Candidate & a, const Candidate & b) {
-                  return a.model_score < b.model_score;
-                });
-
-      if(verbosity_ >= 5) {
-        size_t n_model = 0, n_axis = 0, n_edge = 0;
-        for(const auto & cand : candidates) {
-          if(cand.tag == "model min") n_model++;
-          else if(cand.tag.rfind("cubic axis", 0) == 0) n_axis++;
-          else if(cand.tag.rfind("cubic edge", 0) == 0) n_edge++;
-        }
-        log_(5, "Trial loop: %zu candidates (%zu quadratic-model + "
-               "%zu cubic-axis + %zu cubic-edge); ordered by "
-               "predicted energy so the first Fock build usually "
-               "lands the ODA step.\n",
-               candidates.size(), n_model, n_axis, n_edge);
-      }
-
-      // Trial loop: at each backoff scale, evaluate candidates in
-      // ranked order and stop at the first descent step. When the
-      // model is accurate (always for HF along a linear ray, and
-      // typically for DFT near convergence) the first candidate wins
-      // and only a single Fock build runs per ODA step. Rejected
-      // candidates still feed the orbital history via add_entry, so
-      // subsequent DIIS iterations see the trial densities.
-      bool succ = false;
-      Vector<Tbase> x_accepted;
-      std::pair<DensityMatrix<Torb,Tbase>,FockBuilderReturn<Torb,Tbase>> eval_accepted;
-      for(int scalefac=0; scalefac<=5; scalefac++) {
-        Tbase scale = std::pow(Tbase(2), -scalefac);
-        for(const auto & cand : candidates) {
-          Vector<Tbase> x_scaled = scale * cand.lam;
-          auto eval = evaluate(x_scaled);
-          number_of_fock_evaluations_++;
-          bool ok = add_entry(eval.first, eval.second);
-          if(ok) {
-            succ = true;
-            x_accepted = x_scaled;
-            eval_accepted = std::move(eval);
+          hess(i, i) = 2*(E_i - E_orig - grad(i));
+          for(size_t j=i+1; j<npars; j++) {
+            const auto & F_j = evaluations[j].second.second;
+            const auto & F_i = evaluations[i].second.second;
+            Tbase from_j = trace_diff(D_axis[i], D_orig, F_j) - grad(i);
+            Tbase from_i = trace_diff(D_axis[j], D_orig, F_i) - grad(j);
+            hess(i, j) = (Tbase(1)/Tbase(2))*(from_j + from_i);
+            hess(j, i) = hess(i, j);
           }
-          log_(10, "ODA %s at scale %g gives E = % .10f, change %e%s\n",
-                 cand.tag.c_str(), (double) (scale), (double) (ok ? eval_accepted.second.first : eval.second.first),
-                 (double) ((ok ? eval_accepted.second.first : eval.second.first) - E_orig),
-                 ok ? " (accepted)" : "");
-          if(ok) break;
         }
-        if(succ) break;
-      }
 
-      // Trust-region refinement: after the initial descent, re-anchor
-      // the polytope quadratic model at the accepted iterate using
-      // the gradient observed there (free -- F_accepted has just been
-      // computed) and re-solve the QP. Along a linear ray in density
-      // space the Hartree-Fock energy is exactly quadratic, so this
-      // converges in one refit; for DFT a few iterations catch the
-      // residual non-quadraticity that the initial axis-vertex data
-      // missed. Each refit costs one Fock build. The refined
-      // densities also flow through add_entry so DIIS sees them.
-      //
-      // Refinement stops when any of:
-      //   (a) the QP anchor barely moves (|dlambda|_inf < 100 eps);
-      //   (b) the actual energy drop this refit is below one tenth
-      //       of the SCF convergence threshold (further Fock builds
-      //       cannot influence the outer SCF stopping decision);
-      //   (c) the refit fails to descend;
-      //   (d) max_oda_refits_ iterations have been taken.
-      if(succ && refits_enabled && max_oda_refits_ > 0) {
-        // Anchor for the "worth refining" test: use the improvement
-        // achieved by the accepted initial trial-loop step. Refits
-        // that squeeze at most one-tenth of the convergence threshold
-        // out of it cannot change the outer SCF's stopping decision.
-        const Tbase refit_progress_tol = minimum_useful_descent_();
-        for(int refit=0; refit < max_oda_refits_; refit++) {
-          const auto & F_at_x = eval_accepted.second.second;
-          Tbase E_at_x = eval_accepted.second.first;
-          Vector<Tbase> g_at_x(npars);
-          for(size_t i=0; i<npars; i++)
-            g_at_x(i) = trace_diff(D_axis[i], D_orig, F_at_x);
-          // Re-express the model anchored at x_accepted in the QP's
-          // canonical (E_const + g*lambda + 0.5 lambda^T H lambda)
-          // form. Expanding the Taylor around x_accepted:
-          //   E(lambda) = E_at_x + g_at_x . (lambda - x_accepted)
-          //             + 0.5 (lambda - x_accepted)^T H (lambda - x_accepted).
-          Vector<Tbase> g_eff = g_at_x - hess * x_accepted;
-          Tbase E_eff = E_at_x - g_at_x.dot(x_accepted)
-                      + Tbase(1)/Tbase(2) * (x_accepted.transpose() * hess * x_accepted).value();
-          Vector<Tbase> lam_new;
-          Tbase model_min_new;
-          std::tie(lam_new, model_min_new) = solve_polytope_qp_(
-              hess, g_eff, E_eff, particle_off, particle_len);
-          Vector<Tbase> delta = lam_new - x_accepted;
-          Tbase delta_inf = delta.template lpNorm<Eigen::Infinity>();
-          if(delta_inf < Tbase(100) * eps) {
-            log_(10, "ODA refit %i: |dlambda|_inf = %e below noise, model has "
-                     "converged at the accepted iterate.\n", refit + 1, (double) (delta_inf));
-            break;
+        // Particle layout for the polytope: each active particle's lambda
+        // sub-vector lives on its own simplex {lambda >= 0, sum(lambda) <= 1}.
+        std::vector<size_t> particle_off, particle_len;
+        {
+          size_t off = 0;
+          for(Index p=0; p<number_of_blocks_per_particle_type_.size(); p++) {
+            size_t nt = trial_occupations_per_particle[p].size();
+            if(nt > 0) {
+              particle_off.push_back(off);
+              particle_len.push_back(nt);
+            }
+            off += nt;
           }
-          // Predicted improvement pre-check: if the QP's own model
-          // says the new anchor barely lowers the energy, we can bail
-          // without building the Fock. The model is exact for HF
-          // along a linear ray and typically accurate for DFT near
-          // convergence, so trusting its prediction here saves a Fock
-          // per idle refit call.
-          Tbase model_delta = model_min_new - E_at_x;
-          if(-model_delta < refit_progress_tol) {
-            log_(10, "ODA refit %i: model predicts progress %e below %e; "
-                     "skipping Fock build and exiting refinement.\n",
-                     refit + 1, (double) (-model_delta), (double) (refit_progress_tol));
-            break;
+        }
+        // Minimise the quadratic model on the product-of-simplices
+        // polytope via the active-set QP solver. The previous code
+        // enumerated every face of the polytope (product over particles
+        // of 2^(n_p+1)-1 faces), which is intractable when degenerate
+        // groups span several blocks and produce npars in the tens.
+        const Tbase eps = std::numeric_limits<Tbase>::epsilon();
+        auto model_value = [&](const Vector<Tbase> & lam) {
+          return E_orig + grad.dot(lam) + (Tbase(1)/Tbase(2))*(lam.transpose()*hess*lam).value();
+        };
+        (void) model_value;
+        Vector<Tbase> lam_opt;
+        Tbase model_min;
+        std::tie(lam_opt, model_min) = solve_polytope_qp_(
+            hess, grad, E_orig, particle_off, particle_len);
+        log_(5, "Quadratic model minimum at lambda = (");
+        for(Index i=0; i<lam_opt.size(); i++)
+          log_(5, "%s%g", i ? "," : "", (double) (lam_opt(i)));
+        log_(5, "), model energy change %e\n", (double) (model_min - E_orig));
+
+        // Candidate list: (lambda, tag, model-predicted energy at lambda).
+        // The QP model gives one; along each 1D axis and each pair-
+        // diagonal edge we also fit a cubic Hermite polynomial through
+        // the two endpoint energies and the two endpoint slopes. Those
+        // four data exactly determine a cubic and cost no Fock builds
+        // beyond the npars axis vertices already evaluated. Interior
+        // minima of each 1D cubic become candidates, scored by that
+        // polynomial's own value at the root (the multi-dimensional
+        // quadratic underestimates 1D non-linearity along the ray).
+        //
+        // A quartic is deliberately NOT used. Along a linear ray in
+        // density space the Hartree-Fock energy is exactly quadratic, so
+        // the cubic already carries a spare order for the
+        // exchange-correlation non-linearity. More to the point, no
+        // genuinely independent fifth datum is available for free:
+        //   * H_ii = 2 (E_1 - E_0 - g_0) is itself the Hermite quadratic
+        //     through the same three data, so imposing it makes the
+        //     quartic's residual vanish identically -- it adds nothing.
+        //   * E'(1) - E'(0) is a function of two constraints the fit
+        //     already carries; its residual equals -a3/2 of this very
+        //     cubic, i.e. the same information redistributed.
+        // Both would also form that residual as a difference of two
+        // total energies, so near convergence they amplify roundoff into
+        // spurious stationary points. A real fifth datum would need a
+        // midpoint energy (an extra Fock build per ray) or the
+        // exchange-correlation kernel, which the Fock-builder interface
+        // does not expose.
+        struct Candidate {
+          Vector<Tbase> lam;
+          std::string tag;
+          Tbase model_score;
+        };
+        std::vector<Candidate> candidates;
+        if(lam_opt.template lpNorm<Eigen::Infinity>() > 100*eps)
+          candidates.push_back({lam_opt, "model min", model_min});
+
+        // Fit the cubic through (0, E0, dE0) and (1, E1, dE1) and emit a
+        // candidate at each interior minimum. ``place`` writes the root
+        // into the lambda vector for the ray being probed.
+        auto add_cubic_candidates =
+            [&](Tbase E0, Tbase dE0, Tbase E1, Tbase dE1,
+                const std::string & tag, auto && place) {
+          auto c = HelperRoutines::fit_cubic_polynomial_with_derivatives<Tbase>(
+                       E0, dE0, Tbase(1), E1, dE1);
+          std::pair<Tbase, Tbase> zeros;
+          try {
+            zeros = std::apply(HelperRoutines::cubic_polynomial_zeros<Tbase>, c);
+          } catch(std::logic_error &) {
+            return;   // constant derivative, or no real stationary point
           }
-          auto eval_new = evaluate(lam_new);
-          number_of_fock_evaluations_++;
-          bool ok = add_entry(eval_new.first, eval_new.second);
-          Tbase E_new = eval_new.second.first;
-          Tbase delta_E = E_new - E_at_x;
-          log_(10, "ODA refit %i: |dlambda|_inf = %e, model E = % .10f, "
-                   "actual E = % .10f, change %e%s\n",
-                   refit + 1, (double) (delta_inf), (double) (model_min_new), (double) (E_new), (double) (delta_E),
+          const std::array<Tbase, 4> coeffs = {std::get<0>(c), std::get<1>(c),
+                                               std::get<2>(c), std::get<3>(c)};
+          bool emitted = false;
+          Tbase first_root = Tbase(0);
+          for(Tbase z : {zeros.first, zeros.second}) {
+            if(!(z > 100*eps && z < Tbase(1) - 100*eps))
+              continue;
+            // Keep minima only: f''(z) = 2 a2 + 6 a3 z > 0. The other
+            // root of the derivative is a maximum and is never a useful
+            // trial step. This is the same test the sigma line search
+            // applies to its cubic fits.
+            if(!(Tbase(2)*coeffs[2] + Tbase(6)*coeffs[3]*z > Tbase(0)))
+              continue;
+            // cubic_polynomial_zeros returns a doubled root when the
+            // cubic degenerates to a quadratic; do not emit it twice.
+            if(emitted && std::abs(z - first_root) <= 100*eps)
+              continue;
+            Vector<Tbase> xc = Vector<Tbase>::Zero(npars);
+            place(z, xc);
+            candidates.push_back({std::move(xc), tag,
+                                  HelperRoutines::evaluate_polynomial<Tbase, 4>(coeffs, z)});
+            emitted = true;
+            first_root = z;
+          }
+        };
+
+        for(size_t i=0; i<npars; i++) {
+          Tbase E_i = evaluations[i].second.first;
+          Tbase g_i = grad(i);
+          Tbase slope_at_1 = trace_diff(D_axis[i], D_orig, evaluations[i].second.second);
+          add_cubic_candidates(E_orig, g_i, E_i, slope_at_1,
+                               std::string("cubic axis ") + std::to_string(i),
+                               [i](Tbase z, Vector<Tbase> & xc) { xc(i) = z; });
+        }
+        // Pair-diagonal cubics along each edge from vertex e_i to vertex
+        // e_j, parameterised by t with lambda = (1-t) e_i + t e_j.
+        for(size_t i=0; i<npars; i++) {
+          for(size_t j=i+1; j<npars; j++) {
+            const auto & F_i = evaluations[i].second.second;
+            const auto & F_j = evaluations[j].second.second;
+            Tbase E_i = evaluations[i].second.first;
+            Tbase E_j = evaluations[j].second.first;
+            Tbase slope_i = trace_diff(D_axis[j], D_axis[i], F_i);
+            Tbase slope_j = trace_diff(D_axis[j], D_axis[i], F_j);
+            add_cubic_candidates(E_i, slope_i, E_j, slope_j,
+                                 std::string("cubic edge ") + std::to_string(i) + "-" + std::to_string(j),
+                                 [i,j](Tbase z, Vector<Tbase> & xc) {
+                                   xc(i) = Tbase(1) - z;
+                                   xc(j) = z;
+                                 });
+          }
+        }
+
+        // Rank candidates by their model-predicted energy so the trial
+        // loop tries the most-promising step first. For HF the model
+        // is exact along any linear ray, so the top candidate is the
+        // true minimum and a single Fock build lands the ODA step; for
+        // DFT the ordering is still an accurate heuristic near
+        // convergence, cutting the trial loop from O(N) Fock builds to
+        // one whenever the model doesn't lie.
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate & a, const Candidate & b) {
+                    return a.model_score < b.model_score;
+                  });
+
+        if(verbosity_ >= 5) {
+          size_t n_model = 0, n_axis = 0, n_edge = 0;
+          for(const auto & cand : candidates) {
+            if(cand.tag == "model min") n_model++;
+            else if(cand.tag.rfind("cubic axis", 0) == 0) n_axis++;
+            else if(cand.tag.rfind("cubic edge", 0) == 0) n_edge++;
+          }
+          log_(5, "Trial loop: %zu candidates (%zu quadratic-model + "
+                 "%zu cubic-axis + %zu cubic-edge); ordered by "
+                 "predicted energy so the first Fock build usually "
+                 "lands the ODA step.\n",
+                 candidates.size(), n_model, n_axis, n_edge);
+        }
+
+        // Trial loop: at each backoff scale, evaluate candidates in
+        // ranked order and stop at the first descent step. When the
+        // model is accurate (always for HF along a linear ray, and
+        // typically for DFT near convergence) the first candidate wins
+        // and only a single Fock build runs per ODA step. Rejected
+        // candidates still feed the orbital history via add_entry, so
+        // subsequent DIIS iterations see the trial densities.
+        bool succ = false;
+        Vector<Tbase> x_accepted;
+        std::pair<DensityMatrix<Torb,Tbase>,FockBuilderReturn<Torb,Tbase>> eval_accepted;
+        for(int scalefac=0; scalefac<=5; scalefac++) {
+          Tbase scale = std::pow(Tbase(2), -scalefac);
+          for(const auto & cand : candidates) {
+            Vector<Tbase> x_scaled = scale * cand.lam;
+            auto eval = evaluate(x_scaled);
+            number_of_fock_evaluations_++;
+            bool ok = add_entry(eval.first, eval.second);
+            if(ok) {
+              succ = true;
+              x_accepted = x_scaled;
+              eval_accepted = std::move(eval);
+            }
+            log_(10, "ODA %s at scale %g gives E = % .10f, change %e%s\n",
+                   cand.tag.c_str(), (double) (scale), (double) (ok ? eval_accepted.second.first : eval.second.first),
+                   (double) ((ok ? eval_accepted.second.first : eval.second.first) - E_orig),
                    ok ? " (accepted)" : "");
-          if(!ok) {
-            // Refined step didn't improve on the previously accepted
-            // one. Keep the previous accept and stop refining.
-            break;
+            if(ok) break;
           }
-          x_accepted = lam_new;
-          eval_accepted = std::move(eval_new);
-          if(-delta_E < refit_progress_tol) {
-            // Improvement is smaller than a fraction of the SCF
-            // convergence threshold; further refits cannot influence
-            // the outer stopping decision. Take the last accepted
-            // iterate and let DIIS spend its Fock builds instead.
-            log_(10, "ODA refit %i: further refit progress %e below "
-                     "%e; exiting refinement loop.\n",
-                     refit + 1, (double) (-delta_E), (double) (refit_progress_tol));
-            break;
+          if(succ) break;
+        }
+
+        // Trust-region refinement: after the initial descent, re-anchor
+        // the polytope quadratic model at the accepted iterate using
+        // the gradient observed there (free -- F_accepted has just been
+        // computed) and re-solve the QP. Along a linear ray in density
+        // space the Hartree-Fock energy is exactly quadratic, so this
+        // converges in one refit; for DFT a few iterations catch the
+        // residual non-quadraticity that the initial axis-vertex data
+        // missed. Each refit costs one Fock build. The refined
+        // densities also flow through add_entry so DIIS sees them.
+        //
+        // Refinement stops when any of:
+        //   (a) the QP anchor barely moves (|dlambda|_inf < 100 eps);
+        //   (b) the actual energy drop this refit is below one tenth
+        //       of the SCF convergence threshold (further Fock builds
+        //       cannot influence the outer SCF stopping decision);
+        //   (c) the refit fails to descend;
+        //   (d) max_oda_refits_ iterations have been taken.
+        if(succ && refits_enabled && max_oda_refits_ > 0) {
+          // Anchor for the "worth refining" test: use the improvement
+          // achieved by the accepted initial trial-loop step. Refits
+          // that squeeze at most one-tenth of the convergence threshold
+          // out of it cannot change the outer SCF's stopping decision.
+          const Tbase refit_progress_tol = minimum_useful_descent_();
+          for(int refit=0; refit < max_oda_refits_; refit++) {
+            const auto & F_at_x = eval_accepted.second.second;
+            Tbase E_at_x = eval_accepted.second.first;
+            Vector<Tbase> g_at_x(npars);
+            for(size_t i=0; i<npars; i++)
+              g_at_x(i) = trace_diff(D_axis[i], D_orig, F_at_x);
+            // Re-express the model anchored at x_accepted in the QP's
+            // canonical (E_const + g*lambda + 0.5 lambda^T H lambda)
+            // form. Expanding the Taylor around x_accepted:
+            //   E(lambda) = E_at_x + g_at_x . (lambda - x_accepted)
+            //             + 0.5 (lambda - x_accepted)^T H (lambda - x_accepted).
+            Vector<Tbase> g_eff = g_at_x - hess * x_accepted;
+            Tbase E_eff = E_at_x - g_at_x.dot(x_accepted)
+                        + Tbase(1)/Tbase(2) * (x_accepted.transpose() * hess * x_accepted).value();
+            Vector<Tbase> lam_new;
+            Tbase model_min_new;
+            std::tie(lam_new, model_min_new) = solve_polytope_qp_(
+                hess, g_eff, E_eff, particle_off, particle_len);
+            Vector<Tbase> delta = lam_new - x_accepted;
+            Tbase delta_inf = delta.template lpNorm<Eigen::Infinity>();
+            if(delta_inf < Tbase(100) * eps) {
+              log_(10, "ODA refit %i: |dlambda|_inf = %e below noise, model has "
+                       "converged at the accepted iterate.\n", refit + 1, (double) (delta_inf));
+              break;
+            }
+            // Predicted improvement pre-check: if the QP's own model
+            // says the new anchor barely lowers the energy, we can bail
+            // without building the Fock. The model is exact for HF
+            // along a linear ray and typically accurate for DFT near
+            // convergence, so trusting its prediction here saves a Fock
+            // per idle refit call.
+            Tbase model_delta = model_min_new - E_at_x;
+            if(-model_delta < refit_progress_tol) {
+              log_(10, "ODA refit %i: model predicts progress %e below %e; "
+                       "skipping Fock build and exiting refinement.\n",
+                       refit + 1, (double) (-model_delta), (double) (refit_progress_tol));
+              break;
+            }
+            auto eval_new = evaluate(lam_new);
+            number_of_fock_evaluations_++;
+            bool ok = add_entry(eval_new.first, eval_new.second);
+            Tbase E_new = eval_new.second.first;
+            Tbase delta_E = E_new - E_at_x;
+            log_(10, "ODA refit %i: |dlambda|_inf = %e, model E = % .10f, "
+                     "actual E = % .10f, change %e%s\n",
+                     refit + 1, (double) (delta_inf), (double) (model_min_new), (double) (E_new), (double) (delta_E),
+                     ok ? " (accepted)" : "");
+            if(!ok) {
+              // Refined step didn't improve on the previously accepted
+              // one. Keep the previous accept and stop refining.
+              break;
+            }
+            x_accepted = lam_new;
+            eval_accepted = std::move(eval_new);
+            if(-delta_E < refit_progress_tol) {
+              // Improvement is smaller than a fraction of the SCF
+              // convergence threshold; further refits cannot influence
+              // the outer stopping decision. Take the last accepted
+              // iterate and let DIIS spend its Fock builds instead.
+              log_(10, "ODA refit %i: further refit progress %e below "
+                       "%e; exiting refinement loop.\n",
+                       refit + 1, (double) (-delta_E), (double) (refit_progress_tol));
+              break;
+            }
           }
         }
-      }
 
-      if(succ && this_attempt_is_collapsed)
-        last_oda_via_collapsed_ = true;
-      overall_succ = succ;
+        if(succ && this_attempt_is_collapsed)
+          last_oda_via_collapsed_ = true;
+        overall_succ = succ;
       }  // end for(iattempt)
 
       if(overall_succ) {
