@@ -296,20 +296,25 @@ namespace OpenOrbitalOptimizer {
     /// declaration order.
     SettingRegistry settings_;
 
+    /// Convergence threshold for orbital gradient
     Setting<Tbase> convergence_threshold_{
         settings_, "convergence_threshold",
         "DIIS-error convergence threshold", Tbase(1e-7)};
 
-    /// Safety factor K for the arithmetic-precision clamp on the effective
-    /// convergence threshold: the SCF is considered converged when the DIIS
-    /// error drops below max(convergence_threshold_, K * noise_floor_).
-    /// K = 0 disables the clamp; K > 0 keeps low-precision runs from
-    /// spinning below what the arithmetic can resolve.
+    /// Safety factor K for the arithmetic-precision clamp on the
+    /// effective convergence threshold: the SCF is considered
+    /// converged when the DIIS error drops below
+    /// max(convergence_threshold_, K * noise_floor_). K = 0 disables
+    /// the clamp. K > 0 keeps low-precision runs (float, and
+    /// eventually MPFR at reduced precision) from spinning below
+    /// what the arithmetic can resolve, while __float128 users see
+    /// no change because their epsilon is tiny.
     Setting<Tbase> noise_safety_factor_{
         settings_, "noise_safety_factor",
         "K in effective threshold max(convergence_threshold, K * noise_floor)",
         Tbase(10)};
 
+    /// Norm to use by default: root-mean-square error
     Setting<std::string> error_norm_{
         settings_, "error_norm",
         "DIIS error norm; one of rms, fro, inf, 1, 2",
@@ -317,6 +322,10 @@ namespace OpenOrbitalOptimizer {
         true,
         &SCFSolver::canonicalise_error_norm_};
 
+    /// SCF method mix consumed by run(). Stored in canonical
+    /// (uppercase) form: parse and validate on set("methods", ...).
+    /// Supported tokens: "DIIS", "LCIIS", "ODA", "CG", "LBFGS",
+    /// joined with " + ".
     Setting<std::string> methods_{
         settings_, "methods",
         "SCF method mix consumed by run(); e.g. \"DIIS + ODA + CG\", \"DIIS\", \"LCIIS + ODA + CG\", \"ODA + CG\", \"DIIS + ODA + LBFGS\"",
@@ -324,129 +333,206 @@ namespace OpenOrbitalOptimizer {
         true,
         &SCFSolver::canonicalise_methods_};
 
-    /// Garza and Scuseria, 2012.
+    /// Start to mix in DIIS at this error threshold (Garza and Scuseria, 2012)
     Setting<Tbase> diis_epsilon_{
         settings_, "diis_epsilon",
         "pure-DIIS blend cutoff", Tbase(1e-1)};
 
-    /// Garza and Scuseria, 2012.
+    /// Threshold for pure DIIS (Garza and Scuseria, 2012)
     Setting<Tbase> diis_threshold_{
         settings_, "diis_threshold",
         "A/EDIIS blend cutoff (Garza-Scuseria)", Tbase(1e-4)};
 
-    /// Hamilton and Pulay, 1986.
+    /// Damping factor for DIIS diagonal (Hamilton and Pulay, 1986)
     Setting<Tbase> diis_diagonal_damping_{
         settings_, "diis_diagonal_damping",
         "DIIS matrix diagonal damping", Tbase(0.02)};
 
-    /// Chupin et al, 2021.
+    /// DIIS restart criterion (Chupin et al, 2021)
     Setting<Tbase> diis_restart_factor_{
         settings_, "diis_restart_factor",
         "DIIS history restart factor", Tbase(1e-4)};
 
-    /// Capped separately from maximum_history_length_ because LCIIS holds the
-    /// full M x M grid of mixed commutators [F_i, D_j] at once, so its memory
-    /// grows as M^2 * n_basis^2 and its commutator build as M^2.
+    /// Number of history entries LCIIS extrapolates over. Capped
+    /// separately from maximum_history_length_ because LCIIS holds
+    /// the full M x M grid of mixed commutators [F_i, D_j] at once,
+    /// so its memory grows as M^2 * n_basis^2 and its commutator
+    /// build as M^2 rather than DIIS's M. 0 means "no separate cap".
     Setting<int> lciis_maximum_history_{
         settings_, "lciis_maximum_history",
         "history entries LCIIS extrapolates over (0 = no separate cap)", 6};
 
+    /// Maximum Newton iterations in the LCIIS quartic minimisation.
     Setting<int> lciis_maximum_iterations_{
         settings_, "lciis_maximum_iterations",
         "max Newton iterations in the LCIIS quartic minimisation", 50};
 
+    /// Convergence threshold on the LCIIS Newton step norm.
     Setting<Tbase> lciis_convergence_threshold_{
         settings_, "lciis_convergence_threshold",
         "convergence threshold on the LCIIS Newton step norm", Tbase(1e-10)};
 
+    /// Criterion for max error for which to use optimal damping
     Setting<Tbase> optimal_damping_threshold_{
         settings_, "optimal_damping_threshold",
         "DIIS error above which ODA takes over", Tbase(1)};
 
+    /// Energy gap below which orbitals are treated as degenerate when
+    /// enumerating skeleton density matrices in optimal damping. The
+    /// default of 0.05 Eh (~1.36 eV) is loose enough to group orbitals
+    /// that are degenerate by molecular symmetry but split by O(10 mEh)
+    /// numerical noise during convergence (typical of transition-metal
+    /// d-shells under PBE + UHF/UKS) and tight enough to leave the
+    /// well-separated valence levels of main-group molecules alone.
+    /// Override through optimal_damping_degeneracy_threshold(eps).
     Setting<Tbase> optimal_damping_degeneracy_threshold_{
         settings_, "optimal_damping_degeneracy_threshold",
         "ODA orbital-degeneracy window (Eh)", Tbase(1e-2)};
 
+    /// Maximum number of trust-region refit iterations run inside
+    /// each optimal_damping_step after the initial descent step is
+    /// accepted. Each refit re-anchors the polytope quadratic model
+    /// at the current accepted iterate using the observed gradient
+    /// there and re-solves the QP. Exact for Hartree-Fock along
+    /// any linear ray; each refit costs one Fock build. Default 3;
+    /// 0 disables refinement (falls back to the accepted step from
+    /// the ranked trial loop).
     Setting<int> max_oda_refits_{
         settings_, "max_oda_refits",
         "max trust-region refits inside optimal_damping_step after acceptance (0 disables)",
         3};
 
+    /// Maximum number of iterations
     Setting<int> maximum_iterations_{
         settings_, "maximum_iterations",
         "outer SCF iteration cap", 128};
 
+    /// History length
     Setting<int> maximum_history_length_{
         settings_, "maximum_history_length",
         "DIIS and L-BFGS history depth", 10};
 
+    /// Steps with no DIIS energy improvement after which to use ODA. Previously maximum_history_length_/2
     Setting<int> oda_restart_steps_{
         settings_, "oda_restart_steps",
         "steps of no DIIS progress before switching to ODA", 5};
 
-    /// 0 means size the burst from last_active_rotation_count_ instead.
+    /// Number of orbital-rotation steps to take after each ODA step (when CG is the
+    /// next state at all -- ODA accept with integer occupations still
+    /// skips CG and hands directly to DIIS). The orbital-rotation steps relax the
+    /// orbital rotations at the ODA-chosen occupations before DIIS
+    /// gets its turn. Default value 0 means "use the active-rotation
+    /// count from the most recent ODA call" -- the number of orbital-
+    /// rotation pairs that lie inside a degenerate group and have
+    /// different occupations, summed across particles and blocks
+    /// (see last_active_rotation_count_). That count is at most one
+    /// per Krylov dimension of the badly-preconditioned subspace, so
+    /// the orbital-rotation burst naturally scales with the hard-to-precondition
+    /// part of the active space; 1 orbital-rotation step is taken as a floor.
+    /// Set to an explicit positive value to override.
     Setting<int> orbital_rotation_steps_after_oda_{
         settings_, "orbital_rotation_steps_after_oda",
         "orbital-rotation steps after each ODA (0 = use last_active_rotation_count)",
         0};
 
+    /// Minimal normalized projection of preconditioned search direction onto gradient
     Setting<Tbase> minimal_gradient_projection_{
         settings_, "minimal_gradient_projection",
         "minimum preconditioned-CG projection on gradient", Tbase(1e-4)};
 
+    /// Initial level shift used as the floor in the orbital-rotation
+    /// preconditioner:
+    ///     d_alpha = -g_alpha / (sigma + max(0, h_alpha)),
+    /// starting from sigma = initial_level_shift_ on trial 1 of the
+    /// sigma-line-search. A small floor keeps the well-conditioned
+    /// DOFs in their near-Newton regime (where h_alpha dominates the
+    /// denominator) instead of damping them at the constant 1 Eh that
+    /// the previous default forced; the line search bumps sigma up
+    /// adaptively when wrong-sign or near-degenerate DOFs cause the
+    /// trial step to overshoot.
     Setting<Tbase> initial_level_shift_{
         settings_, "initial_level_shift",
         "orbital-rotation preconditioner floor", Tbase(1e-3)};
 
+    /// Level shift diminution factor
     Setting<Tbase> level_shift_factor_{
         settings_, "level_shift_factor",
         "level-shift diminution factor", Tbase(2)};
 
+    /// Threshold for detection of occupied orbitals
     Setting<Tbase> occupied_threshold_{
         settings_, "occupied_threshold",
         "occupied-orbital detection cutoff", Tbase(1e-6)};
 
+    /// Norm-squared tolerance for deduplicating skeleton occupations
     Setting<Tbase> occupation_change_threshold_{
         settings_, "occupation_change_threshold",
         "occupation-equality tolerance", Tbase(1e-6)};
 
-    /// History cleanup criterion: keep only those density matrices that
-    /// satisfy delta ||P0-Pi|| < min_{j>0} ||P0-Pj||.
+    /// History cleanup criterion: keep only those density matrices that satisfy delta ||P0-Pi|| < min_{j>0} ||P0-Pj||
     Setting<Tbase> density_restart_factor_{
         settings_, "density_restart_factor",
         "history density-diff restart factor", Tbase(1e-4)};
 
+    /// (Optional) freeze occupations altogether to their previous values
     Setting<int> frozen_occupations_{
         settings_, "frozen_occupations",
         "pin occupations across SCF (0 or 1)", 0};
 
+    /// Verbosity level: 0 for silent, higher values for more info
     Setting<int> verbosity_{
         settings_, "verbosity",
         "0..30", 5};
 
-    /// Frozen at the start of run() from the initial Fock. The one-electron
-    /// part dominates basis conditioning, so refreshing this per iteration
-    /// would be noise itself.
+    /// Noise floor of the DIIS error, frozen at the start of run()
+    /// from the initial Fock. The one-electron part dominates basis
+    /// conditioning, so refreshing this per iteration would be
+    /// noise itself; freezing keeps the effective threshold stable
+    /// across the run.
     Setting<Tbase> noise_floor_{
         settings_, "noise_floor",
         "frozen roundoff floor of DIIS error, populated by run()",
         Tbase(0),
         false};
 
+    /// Number of Fock matrix evaluations
     Setting<int> number_of_fock_evaluations_{
         settings_, "number_of_fock_evaluations",
         "Fock-evaluation counter (reset on initialize_with_*)", 0, false};
 
+    /// Number of skeleton dimensions of the most recent ODA call (the
+    /// N_par variable inside optimal_damping_step). Read by the run()
+    /// state machine to size the orbital-rotation burst when orbital_rotation_steps_after_oda_ is
+    /// left at its default.
     Setting<int> last_polytope_dimension_{
         settings_, "last_polytope_dimension",
         "ODA polytope dimension of the most recent optimal_damping_step",
         0,
         false};
 
+    /// Number of orbital-rotation DOFs in degenerate groups at the
+    /// iterate that emerged from the most recent ODA call:
+    ///
+    ///     sum_p sum_b sum_g  #pairs(i,j) in g with n_i != n_j
+    ///
+    /// where g runs over the maximal clusters of orbitals within block
+    /// b of particle p that have orbital energies within
+    /// optimal_damping_degeneracy_threshold_ of each other. This is
+    /// the rotation-DOF count that the diagonal Hessian preconditioner
+    /// handles poorly; preconditioned CG needs at most this many steps
+    /// to relax the active subspace at fixed occupations (for a
+    /// quadratic functional, exactly this many; for DFT, generally
+    /// fewer with the cubic-Hermite line search). Used as the default
+    /// orbital-rotation burst length when orbital_rotation_steps_after_oda_ is left at zero.
     Setting<int> last_active_rotation_count_{
         settings_, "last_active_rotation_count",
         "active rotations counted by the most recent ODA step", 0, false};
 
+    /// Whether the SCF is converged, exposed through the string facade
+    /// as 0 or 1. Carries no stored value: reading it re-evaluates
+    /// ``converged()`` against the current history, so it reflects the
+    /// solver's state now rather than whatever it was when the flag was
+    /// last written.
     Setting<int> converged_{
         settings_, "converged",
         "0 or 1 -- re-evaluates the convergence rule now",
