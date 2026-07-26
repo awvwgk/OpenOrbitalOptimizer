@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -369,6 +370,55 @@ int main() {
 
     REQUIRE(lc.converged());
     REQUIRE(std::abs(lc.get_energy() - ref.get_energy()) < 1e-10);
+  }
+
+  {
+    // The settings register themselves with a registry that records
+    // offsets, not addresses, so that the facade keeps working after
+    // the solver is moved. Had it stored addresses, every lookup below
+    // would reach into the moved-from object.
+    // The source is heap-allocated and freed immediately after the
+    // move, so that a registry of addresses would be left pointing at
+    // released storage rather than at a live object that happens to
+    // still hold the same values. Keeping the source alive would let
+    // the address-based bug pass this test unnoticed -- and short
+    // strings survive a move intact under SSO, so reading "methods"
+    // back would not have caught it either.
+    auto source = std::make_unique<SCFSolver<double, double>>(make_solver());
+    source->set(std::string("convergence_threshold"), 1.25e-9);
+    source->set(std::string("methods"), std::string("ODA"));
+    source->set(std::string("maximum_iterations"), 77);
+
+    SCFSolver<double, double> moved = std::move(*source);
+    source.reset();
+
+    REQUIRE(moved.get_real("convergence_threshold") == 1.25e-9);
+    REQUIRE(moved.get_string("methods") == "ODA");
+    REQUIRE(moved.get_int("maximum_iterations") == 77);
+
+    // Writing through the moved-to object must land in the moved-to
+    // object.
+    moved.set(std::string("maximum_iterations"), 33);
+    REQUIRE(moved.get_int("maximum_iterations") == 33);
+
+    // Every catalogued setting must still resolve in the moved-to
+    // object: its registry has to describe all of them, not just the
+    // three read back above.
+    for (const auto & opt : catalog) {
+      const std::string type = opt.type;
+      if (type == "real")        (void) moved.get_real(opt.key);
+      else if (type == "int")    (void) moved.get_int(opt.key);
+      else if (type == "string") (void) moved.get_string(opt.key);
+      else { std::printf("unknown type %s\n", opt.type); ++failures; }
+    }
+
+    // And it must still solve: the settings the SCF loop reads are the
+    // same objects the facade just wrote to.
+    FockMatrix<double> g(1);
+    g[0] = Matrix<double>::Identity(2, 2) * -1.0;
+    moved.initialize_with_fock(g);
+    moved.run();
+    REQUIRE(moved.converged());
   }
 
   std::printf("%s: %d failure(s)\n", __FILE__, failures);
