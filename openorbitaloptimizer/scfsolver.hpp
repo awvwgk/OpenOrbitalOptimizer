@@ -379,12 +379,12 @@ namespace OpenOrbitalOptimizer {
 
     /// Energy gap below which orbitals are treated as degenerate when
     /// enumerating skeleton density matrices in optimal damping. The
-    /// default of 0.05 Eh (~1.36 eV) is loose enough to group orbitals
-    /// that are degenerate by molecular symmetry but split by O(10 mEh)
-    /// numerical noise during convergence (typical of transition-metal
-    /// d-shells under PBE + UHF/UKS) and tight enough to leave the
+    /// default of 0.01 Eh (~0.27 eV) is loose enough to group orbitals
+    /// that are degenerate by molecular symmetry but split by numerical
+    /// noise during convergence (typical of transition-metal d-shells
+    /// under PBE + UHF/UKS) and tight enough to leave the
     /// well-separated valence levels of main-group molecules alone.
-    /// Override through optimal_damping_degeneracy_threshold(eps).
+    /// Override through set("optimal_damping_degeneracy_threshold", eps).
     Setting<Tbase> optimal_damping_degeneracy_threshold_{
         settings_, "optimal_damping_degeneracy_threshold",
         "ODA orbital-degeneracy window (Eh)", Tbase(1e-2)};
