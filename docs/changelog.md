@@ -68,6 +68,39 @@
   unaffected.
 
 #### Enhancements
+* Each setting is now a single self-describing object. An option used
+  to be named in three places -- the ``options()`` catalog and one
+  branch each in the ``set_*`` and ``get_*`` if-else chains -- so 31
+  settings carried 88 copies of their key strings, and adding a knob
+  meant editing three lists that nothing checked against each other.
+  A catalog entry could disagree with what the dispatch actually
+  accepted, silently.
+    - A setting's value, key, documentation and validator now live
+      together in one declaration: ``Setting<T>`` holds the value and
+      derives from an abstract ``SettingBase`` carrying everything
+      that does not depend on ``T``. ``options()``, ``set_*`` and
+      ``get_*`` all read off the settings themselves, so a key string
+      appears exactly once and the catalog cannot drift out of step
+      with the dispatch.
+    - Settings register themselves as they are constructed, so adding a
+      knob is one declaration and nothing else -- there is no list to
+      remember to append to, and a setting that is declared but not
+      published is no longer possible to write. The registry records
+      each setting's offset within the solver rather than its address,
+      so the facade keeps working after the solver is moved.
+    - ``Setting<T>`` converts implicitly to ``const T &`` and assigns
+      from ``T``, so the ~195 uses of these members in the solver
+      read as they did before.
+    - A setting may carry a write validator or a read recompute, as a
+      pointer to the member function implementing it. This covers the
+      two settings that validate (``error_norm`` probes the norm,
+      ``methods`` parses and canonicalises) and the five read-only
+      diagnostics.
+    - The typed getters and setters are one shared template body
+      differing only in ``T``, replacing three near-identical
+      if-else chains.
+    - Setting a read-only diagnostic now reports it as read-only
+      rather than as an unknown key.
 * ODA now tries a "collapsed" polytope first: when the full
   skeleton enumeration would exceed ``n_particle_types``, each
   particle's skeleton set is replaced by its arithmetic mean --
