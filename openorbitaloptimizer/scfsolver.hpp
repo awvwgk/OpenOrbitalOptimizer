@@ -1953,6 +1953,40 @@ namespace OpenOrbitalOptimizer {
       }
     }
 
+    /// Make the natural occupations of a convex combination of
+    /// densities non-negative and particle-conserving: clamp away
+    /// negative occupations, then rescale what is left so the block
+    /// sums to ``target``, the trace the mixed density actually has.
+    ///
+    /// Both properties are invariants of the mixing rather than
+    /// things to hope the eigensolver delivered. Every ingredient
+    /// density is positive semidefinite with a known trace and the
+    /// mixing coefficients lie on their simplex, so the mixture must
+    /// be too; any negative occupation is noise, and any departure of
+    /// the sum from ``target`` is the eigendecomposition's roundoff.
+    ///
+    /// Rescaling rather than discarding is what keeps the step
+    /// conservative. Snapping occupations below a tolerance to zero
+    /// throws away up to that tolerance per orbital with nothing to
+    /// put it back, and since the result is fed forward as the next
+    /// iterate the loss compounds instead of staying an output
+    /// artifact. With the ``sqrt(eps) * max_occ`` tolerance this call
+    /// site used to pass -- 3.0e-8 for an s block, 2.1e-7 for an f
+    /// block -- a converged SCF on a block with a Rydberg tail could
+    /// end up short of its particle number by ~6e-7 electrons, and
+    /// tightening ``convergence_threshold`` did not help, because the
+    /// shortfall was a fixed truncation and not an unconverged
+    /// iterate.
+    void conserve_block_occupations_(Vector<Tbase> & occupations,
+                                     Tbase target) const {
+      for(Index k = 0; k < occupations.size(); k++)
+        if(occupations(k) < Tbase(0))
+          occupations(k) = Tbase(0);
+      Tbase sum = occupations.sum();
+      if(sum > std::numeric_limits<Tbase>::min())
+        occupations *= target / sum;
+    }
+
     /// Perform DIIS extrapolation of density matrix
     DensityMatrix<Torb, Tbase> extrapolate_density(const Vector<Tbase> & weights) const {
       if(weights.size() != (Index)orbital_history_.size()) {
@@ -2236,7 +2270,17 @@ namespace OpenOrbitalOptimizer {
     /// used by ``run()`` for the one-shot check that ``converged()``
     /// really is a stationary point of the full skeleton set and not
     /// of the collapsed one.
-    bool optimal_damping_step(bool force_full = false) {
+    ///
+    /// ``exclude_reference`` replaces the current density at the
+    /// polytope's lambda = 0 vertex with the plain Aufbau filling of
+    /// the current Fock matrix, so the search runs over the skeletons
+    /// alone. Every skeleton is an Aufbau filling of one common set of
+    /// orbitals, so every point of the polytope becomes a convex
+    /// combination of such fillings -- full below the Fermi level,
+    /// zero above it, fractional only inside the degenerate cluster
+    /// the Fermi level lands in. See ``aufbau_cleanup_step``.
+    bool optimal_damping_step(bool force_full = false,
+                              bool exclude_reference = false) {
       auto particles_left = [](Tbase n) {
         return n >= 10*std::numeric_limits<Tbase>::epsilon();
       };
@@ -2250,6 +2294,9 @@ namespace OpenOrbitalOptimizer {
       auto diagonalized_fock = compute_orbitals(reference_fock);
       auto new_orbitals = diagonalized_fock.first;
       auto new_orbital_energies = diagonalized_fock.second;
+
+      if(exclude_reference)
+        reference_orbitals = new_orbitals;
 
       // Skeleton occupations per particle type: [iparticle][itrial][iblock_within_particle]
       std::vector<std::vector<std::vector<Vector<Tbase>>>> trial_occupations_per_particle(number_of_blocks_per_particle_type_.size());
@@ -2433,6 +2480,49 @@ namespace OpenOrbitalOptimizer {
       bool overall_succ = false;
       for(size_t iattempt = 0; iattempt < attempts.size() && !overall_succ; iattempt++) {
         trial_occupations_per_particle = std::move(attempts[iattempt]);
+
+        if(exclude_reference) {
+          // Reparametrise the polytope so the current density drops
+          // out of it. One skeleton is promoted to the lambda = 0
+          // vertex and removed from the axes, which leaves n skeletons
+          // described by n-1 parameters -- the simplex they span,
+          // exactly. Promoting a skeleton without removing it would
+          // describe the same simplex with n parameters, and the extra
+          // one does nothing: raising its lambda while the slack
+          // 1 - sum(lambda) falls moves no density, so the model
+          // Hessian would carry a zero mode and the axis vertex would
+          // cost a Fock build to re-evaluate the reference.
+          //
+          // Nothing else has to change. The polytope is still
+          // {lambda >= 0, sum(lambda) <= 1}, so the QP, the cubic rays
+          // and the backoff scaling all work as they are -- but every
+          // vertex is now an Aufbau filling of one common set of
+          // orbitals, so every point in it is a convex combination of
+          // those and has them as its natural orbitals. Mixing
+          // densities that carry *different* orbitals is what makes
+          // the natural occupations depart from Aufbau, and the
+          // current density was the only ingredient doing it.
+          for(size_t iparticle = 0;
+              iparticle < trial_occupations_per_particle.size(); iparticle++) {
+            auto & trials = trial_occupations_per_particle[iparticle];
+            if(trials.empty()) continue;
+            const size_t offset = particle_block_offset(iparticle);
+            for(size_t iblock = 0; iblock < trials[0].size(); iblock++)
+              reference_occupations[offset + iblock] = trials[0][iblock];
+            trials.erase(trials.begin());
+          }
+          auto reference_build = fock_builder_(
+              std::make_pair(reference_orbitals, reference_occupations));
+          number_of_fock_evaluations_++;
+          reference_energy = reference_build.first;
+          // The promoted vertex is a genuine density; let it compete
+          // for the solution like any other trial this step evaluates.
+          add_entry(std::make_pair(reference_orbitals, reference_occupations),
+                    reference_build);
+          log_(5, "Aufbau cleanup: lambda = 0 vertex is now a skeleton, "
+                  "energy % .10f\n", (double) (reference_energy));
+        }
+
         const bool refits_enabled = (iattempt == attempts.size() - 1);
         const bool this_attempt_is_collapsed =
             (iattempt == 0 && attempts.size() > 1);
@@ -2463,8 +2553,21 @@ namespace OpenOrbitalOptimizer {
           size_t iparam=0;
           for(Index iparticle=0; iparticle<number_of_blocks_per_particle_type_.size(); iparticle++) {
             size_t ntrial = trial_occupations_per_particle[iparticle].size();
-            if(ntrial==0)
+            if(ntrial==0) {
+              // No axes for this particle, so its density is the
+              // lambda = 0 vertex and nothing interpolates. Copy the
+              // reference across rather than falling through, which
+              // would leave this particle's blocks default-constructed
+              // and hand back a density with holes in it.
+              for(size_t iblock_particle = 0;
+                  iblock_particle < (size_t)number_of_blocks_per_particle_type_(iparticle);
+                  iblock_particle++) {
+                size_t iblock = iblock_particle + particle_block_offset(iparticle);
+                interp_orbs[iblock] = reference_orbitals[iblock];
+                interp_occs[iblock] = reference_occupations[iblock];
+              }
               continue;
+            }
             // Project this particle's lambda block onto its simplex
             // {lambda >= 0, sum(lambda) <= 1} before using it.
             //
@@ -2500,36 +2603,42 @@ namespace OpenOrbitalOptimizer {
                   new_orbitals[iblock], new_occ, maximum_occupation_(iblock));
               Matrix<Torb> mix_dm = (Tbase(1) - lambda_sum)*old_dm + new_dm;
 
-              // Noise tolerances for the natural occupations. Both are
-              // powers of epsilon so they stay tight in extended
-              // precision, and both scale with the block's occupation
-              // magnitude.
-              //
-              // An absolute multiple of epsilon is right for a density
-              // that was just built, but far too tight for one that has
-              // been projected between basis sets and then mixed: the
-              // eigendecomposition of such a matrix carries error of
-              // order cond * eps, which can be thousands of epsilons.
-              //   zero_tol = sqrt(eps)      ~ 1.5e-8 (double), 1e-17 (quad)
-              //   fail_tol = eps^(1/4)      ~ 1.2e-4 (double), 1e-8  (quad)
-              // Occupations below zero_tol are chemically meaningless
-              // and are clamped to zero; the guard then fires only on
-              // occupations negative enough to mean a genuinely corrupt
-              // density (order 0.1), never on numerical noise.
-              //
               // Unlike the DIIS extrapolation this *is* a convex
               // combination -- lam_p was just projected onto its
               // simplex -- so the mixed density must be positive
-              // semidefinite and the guard is meaningful.
+              // semidefinite and must carry the trace its ingredients
+              // carried. Both are invariants of the step, so they are
+              // enforced below rather than left to the accuracy of the
+              // eigendecomposition.
+              //
+              // The abort guard is what distinguishes noise from a
+              // genuinely corrupt density, and it fires below
+              // -eps^(1/4) (~1.2e-4 in double, 1e-8 in quad). That is
+              // deliberately loose: a density projected between basis
+              // sets and then mixed has an eigendecomposition carrying
+              // error of order cond * eps, which can be thousands of
+              // epsilons. It is checked on the raw occupations, before
+              // the clean-up below hides anything from it.
               const Tbase eps_occ   = std::numeric_limits<Tbase>::epsilon();
               const Tbase occ_scale = std::max(Tbase(1), maximum_occupation_(iblock));
-              const Tbase zero_tol  = std::sqrt(eps_occ) * occ_scale;
               const Tbase fail_tol  = std::sqrt(std::sqrt(eps_occ)) * occ_scale;
 
-              natural_orbitals_(mix_dm, zero_tol,
+              // Nothing is snapped to zero here: see
+              // conserve_block_occupations_ for why discarding small
+              // occupations is not free.
+              natural_orbitals_(mix_dm, Tbase(0),
                                 interp_orbs[iblock], interp_occs[iblock]);
               require_nonnegative_occupations_(interp_occs[iblock], iblock,
                                                fail_tol);
+              // The target trace comes from the ingredients, not from
+              // mix_dm: the orbitals are orthonormal, so each block's
+              // density has the trace its occupation vector sums to,
+              // and reading it off the inputs keeps the target free of
+              // the very roundoff being corrected for.
+              conserve_block_occupations_(
+                  interp_occs[iblock],
+                  (Tbase(1) - lambda_sum) * reference_occupations[iblock].sum()
+                    + new_occ.sum());
             }
             iparam += ntrial;
           }
@@ -4404,6 +4513,44 @@ namespace OpenOrbitalOptimizer {
       return occupations;
     }
 
+    /// Replace the converged iterate's occupations with the Aufbau
+    /// filling of the converged Fock matrix.
+    ///
+    /// What the SCF reports at convergence is the natural occupation
+    /// vector of a *mixed* density. A mixture of densities carrying
+    /// different orbitals is not idempotent shell by shell, so a
+    /// nominally full shell comes out at max_occ - epsilon and
+    /// orbitals well above the Fermi level carry epsilon -- even
+    /// though the minimiser of a fractional-occupation energy
+    /// functional is Aufbau: full below the Fermi level, zero above
+    /// it, fractional only inside the degenerate cluster at it.
+    ///
+    /// This is one ODA step with the current density left out of the
+    /// polytope. That is all it takes, because the mixing is the whole
+    /// problem: every skeleton is an Aufbau filling of one common set
+    /// of orbitals, so any combination of skeletons alone has those
+    /// same orbitals as its natural orbitals and the combined
+    /// occupation vector as its occupations, exactly. The Aufbau
+    /// structure is inherited rather than imposed, and the
+    /// Fermi-level fractions come from minimising the energy over the
+    /// skeleton simplex rather than from a filling rule -- which
+    /// matters, since that is the one place where the occupations are
+    /// genuinely free.
+    ///
+    /// Being an ODA step, it is adopted only if it lowers the energy;
+    /// a cleanup that raised it would mean the converged iterate was
+    /// not the Aufbau minimiser it is reported to be, which is worth
+    /// leaving visible rather than papering over.
+    bool aufbau_cleanup_step() {
+      if(frozen_occupations_) {
+        log_(5, "Aufbau cleanup skipped: occupations are frozen.\n");
+        return false;
+      }
+      log_(5, "Aufbau cleanup: ODA over the skeletons alone.\n");
+      return optimal_damping_step(/*force_full=*/true,
+                                  /*exclude_reference=*/true);
+    }
+
     /// Check if we are converged
     bool converged() const {
         // Nothing has been iterated yet, so trivially not converged.
@@ -4700,6 +4847,12 @@ namespace OpenOrbitalOptimizer {
                       "treating as converged.\n",
                       (double) (actual_descent), (double) (min_useful_descent));
           }
+          // The iterate is a mixed density, whose natural occupations
+          // are only Aufbau up to the residual mixing. Report the
+          // Aufbau filling of the converged Fock matrix instead, when
+          // it does not cost energy.
+          aufbau_cleanup_step();
+
           log_(1, "Converged to energy % .10f!\n", (double) (get_energy()));
 
           // Print out info
