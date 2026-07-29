@@ -1951,6 +1951,40 @@ namespace OpenOrbitalOptimizer {
       }
     }
 
+    /// Make the natural occupations of a convex combination of
+    /// densities non-negative and particle-conserving: clamp away
+    /// negative occupations, then rescale what is left so the block
+    /// sums to ``target``, the trace the mixed density actually has.
+    ///
+    /// Both properties are invariants of the mixing rather than
+    /// things to hope the eigensolver delivered. Every ingredient
+    /// density is positive semidefinite with a known trace and the
+    /// mixing coefficients lie on their simplex, so the mixture must
+    /// be too; any negative occupation is noise, and any departure of
+    /// the sum from ``target`` is the eigendecomposition's roundoff.
+    ///
+    /// Rescaling rather than discarding is what keeps the step
+    /// conservative. Snapping occupations below a tolerance to zero
+    /// throws away up to that tolerance per orbital with nothing to
+    /// put it back, and since the result is fed forward as the next
+    /// iterate the loss compounds instead of staying an output
+    /// artifact. With the ``sqrt(eps) * max_occ`` tolerance this call
+    /// site used to pass -- 3.0e-8 for an s block, 2.1e-7 for an f
+    /// block -- a converged SCF on a block with a Rydberg tail could
+    /// end up short of its particle number by ~6e-7 electrons, and
+    /// tightening ``convergence_threshold`` did not help, because the
+    /// shortfall was a fixed truncation and not an unconverged
+    /// iterate.
+    void conserve_block_occupations_(Vector<Tbase> & occupations,
+                                     Tbase target) const {
+      for(Index k = 0; k < occupations.size(); k++)
+        if(occupations(k) < Tbase(0))
+          occupations(k) = Tbase(0);
+      Tbase sum = occupations.sum();
+      if(sum > std::numeric_limits<Tbase>::min())
+        occupations *= target / sum;
+    }
+
     /// Perform DIIS extrapolation of density matrix
     DensityMatrix<Torb, Tbase> extrapolate_density(const Vector<Tbase> & weights) const {
       if(weights.size() != (Index)orbital_history_.size()) {
@@ -2498,36 +2532,42 @@ namespace OpenOrbitalOptimizer {
                   new_orbitals[iblock], new_occ, maximum_occupation_(iblock));
               Matrix<Torb> mix_dm = (Tbase(1) - lambda_sum)*old_dm + new_dm;
 
-              // Noise tolerances for the natural occupations. Both are
-              // powers of epsilon so they stay tight in extended
-              // precision, and both scale with the block's occupation
-              // magnitude.
-              //
-              // An absolute multiple of epsilon is right for a density
-              // that was just built, but far too tight for one that has
-              // been projected between basis sets and then mixed: the
-              // eigendecomposition of such a matrix carries error of
-              // order cond * eps, which can be thousands of epsilons.
-              //   zero_tol = sqrt(eps)      ~ 1.5e-8 (double), 1e-17 (quad)
-              //   fail_tol = eps^(1/4)      ~ 1.2e-4 (double), 1e-8  (quad)
-              // Occupations below zero_tol are chemically meaningless
-              // and are clamped to zero; the guard then fires only on
-              // occupations negative enough to mean a genuinely corrupt
-              // density (order 0.1), never on numerical noise.
-              //
               // Unlike the DIIS extrapolation this *is* a convex
               // combination -- lam_p was just projected onto its
               // simplex -- so the mixed density must be positive
-              // semidefinite and the guard is meaningful.
+              // semidefinite and must carry the trace its ingredients
+              // carried. Both are invariants of the step, so they are
+              // enforced below rather than left to the accuracy of the
+              // eigendecomposition.
+              //
+              // The abort guard is what distinguishes noise from a
+              // genuinely corrupt density, and it fires below
+              // -eps^(1/4) (~1.2e-4 in double, 1e-8 in quad). That is
+              // deliberately loose: a density projected between basis
+              // sets and then mixed has an eigendecomposition carrying
+              // error of order cond * eps, which can be thousands of
+              // epsilons. It is checked on the raw occupations, before
+              // the clean-up below hides anything from it.
               const Tbase eps_occ   = std::numeric_limits<Tbase>::epsilon();
               const Tbase occ_scale = std::max(Tbase(1), maximum_occupation_(iblock));
-              const Tbase zero_tol  = std::sqrt(eps_occ) * occ_scale;
               const Tbase fail_tol  = std::sqrt(std::sqrt(eps_occ)) * occ_scale;
 
-              natural_orbitals_(mix_dm, zero_tol,
+              // Nothing is snapped to zero here: see
+              // conserve_block_occupations_ for why discarding small
+              // occupations is not free.
+              natural_orbitals_(mix_dm, Tbase(0),
                                 interp_orbs[iblock], interp_occs[iblock]);
               require_nonnegative_occupations_(interp_occs[iblock], iblock,
                                                fail_tol);
+              // The target trace comes from the ingredients, not from
+              // mix_dm: the orbitals are orthonormal, so each block's
+              // density has the trace its occupation vector sums to,
+              // and reading it off the inputs keeps the target free of
+              // the very roundoff being corrected for.
+              conserve_block_occupations_(
+                  interp_occs[iblock],
+                  (Tbase(1) - lambda_sum) * reference_occupations[iblock].sum()
+                    + new_occ.sum());
             }
             iparam += ntrial;
           }

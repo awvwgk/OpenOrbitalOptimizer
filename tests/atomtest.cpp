@@ -1194,14 +1194,51 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Particle-number conservation check. The mixing steps only ever
+  // form convex combinations of densities that already carry the
+  // requested number of electrons, so the converged occupations have
+  // to sum back to it; a shortfall means something along the way
+  // discarded occupation instead of redistributing it. Anything above
+  // a generous multiple of the arithmetic floor is a bug rather than
+  // an unconverged iterate, and it does not shrink when
+  // convergence_threshold is tightened, so this is checked here rather
+  // than folded into the SCF convergence test.
+  auto check_particle_number =
+    [&](const OpenOrbitalOptimizer::SCFSolver<double, double> & scfsolver) {
+      auto occupations = scfsolver.get_orbital_occupations();
+      double total = 0.0;
+      for(size_t iblock = 0; iblock < occupations.size(); iblock++)
+        total += occupations[iblock].sum();
+      const double expected = Z - Q;
+      // Sized to sit between the two regimes rather than at a round
+      // number: with the occupations conserved the residual is pure
+      // summation roundoff, measured at 0 for oxygen and 1.1e-14 for
+      // iron, while the snapping bug this guards against left
+      // 2.5e-12 (O, M=1), 6.2e-12 (O, M=3) and 6.6e-10 (Fe, M=5).
+      const double tolerance = 1e-13 * std::max(1.0, expected);
+      printf("Total occupation % .12f, requested % .12f, difference %e\n",
+             total, expected, total - expected);
+      if(std::abs(total - expected) > tolerance) {
+        printf("Particle number is not conserved: |difference| %e exceeds %e\n",
+               std::abs(total - expected), tolerance);
+        return false;
+      }
+      return true;
+    };
+
+  bool conserved = true;
   if(pbasisfile.size()) {
+    // The NEO driver carries protons as a second particle type, so the
+    // electron count alone is not what the occupations sum to.
     OpenOrbitalOptimizer::AtomicSolver::unrestricted_neo_scf(Z, Q, M, x_func_id, c_func_id, epc_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, protonic_basis, proton_mass, verbosity, core_excitation, oda, oda_degeneracy_threshold, maxiter, methods_override);
   } else {
     if(M==1) {
-      OpenOrbitalOptimizer::AtomicSolver::restricted_scf(Z, Q, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, core_excitation, oda, oda_degeneracy_threshold, maxiter, methods_override);
+      conserved = check_particle_number(
+        OpenOrbitalOptimizer::AtomicSolver::restricted_scf(Z, Q, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, core_excitation, oda, oda_degeneracy_threshold, maxiter, methods_override));
     } else {
-      OpenOrbitalOptimizer::AtomicSolver::unrestricted_scf(Z, Q, M, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, core_excitation, oda, oda_degeneracy_threshold, maxiter, methods_override);
+      conserved = check_particle_number(
+        OpenOrbitalOptimizer::AtomicSolver::unrestricted_scf(Z, Q, M, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, core_excitation, oda, oda_degeneracy_threshold, maxiter, methods_override));
     }
   }
-  return 0;
+  return conserved ? 0 : 1;
 }
