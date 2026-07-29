@@ -154,7 +154,7 @@ PYBIND11_MODULE(_ext, m) {
          "``methods`` setting before running; otherwise the current value\n"
          "is used. Tokens (case-insensitive, '+'-separated): 'DIIS',\n"
          "'ODA', 'CG', 'LBFGS'. Examples: 'DIIS', 'ODA + CG',\n"
-         "'DIIS + ODA + CG' (the default).")
+         "'DIIS + ODA + LBFGS' (the default).")
 
     // --- State queries ------------------------------------------------
     .def("get_solution", &Solver::get_solution,
