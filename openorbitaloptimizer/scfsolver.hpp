@@ -187,11 +187,12 @@ namespace OpenOrbitalOptimizer {
     ///
     /// It records each setting's offset from the registry rather than
     /// its address. An address would belong to the object the setting
-    /// was constructed in, and SCFSolver is movable, so a registry of
-    /// addresses would point into the moved-from object. Offsets
-    /// describe the class layout instead, which is by definition the
-    /// same in the moved-to object, so the implicitly generated move
-    /// stays correct and needs no fixup.
+    /// was constructed in, and SCFSolver is copyable and movable, so a
+    /// registry of addresses would point into the source object.
+    /// Offsets describe the class layout instead, which is by
+    /// definition the same in the destination object, so the
+    /// implicitly generated copy and move stay correct and need no
+    /// fixup.
     class SettingRegistry {
     public:
       /// Called by each Setting's constructor. The conversion to
@@ -624,9 +625,10 @@ namespace OpenOrbitalOptimizer {
     /// y = g_new - g_old pair can be formed on entry to the next call.
     /// All members are cleared whenever the orbital basis changes
     /// globally (ODA accept), the line search fails, or the DOF set
-    /// changes. The owning solver only allocates the struct on the
-    /// first lbfgs_step() call, so when the user has not enabled
-    /// L-BFGS the deque headers are not present at all.
+    /// changes. An empty state costs six empty container headers and
+    /// no heap allocation, so it is held by value: a pointer would buy
+    /// nothing but a null check at every use and the risk of a
+    /// dangling reference when the state is reset mid-step.
     struct LBFGSState {
       std::deque<Vector<Tbase>> s;
       std::deque<Vector<Tbase>> y;
@@ -635,7 +637,7 @@ namespace OpenOrbitalOptimizer {
       Vector<Tbase> pending_g;
       std::vector<OrbitalRotation> history_dofs;
     };
-    std::unique_ptr<LBFGSState> lbfgs_;
+    LBFGSState lbfgs_;
 
     /// Method-mix flags parsed from methods_. Shared by run() and the
     /// validator in set("methods", ...).
@@ -2915,9 +2917,8 @@ namespace OpenOrbitalOptimizer {
       if(overall_succ) {
         // ODA has globally rearranged the orbital basis (and possibly
         // the occupation pattern); the recorded PR+ CG state is no
-        // longer tied to the current iterate. The lazy L-BFGS state
-        // is also released if it was allocated; clear_lbfgs_state_()
-        // is a no-op when L-BFGS has not been used.
+        // longer tied to the current iterate, and neither is the
+        // L-BFGS curvature history.
         // The end-of-iteration cleanup() in run() runs the density-
         // matrix-difference pruning; doing it here too would print the
         // "Density matrix difference ..." line twice per ODA iteration.
@@ -3406,11 +3407,10 @@ namespace OpenOrbitalOptimizer {
       return success;
     }
 
-    /// Release the L-BFGS state, returning its storage to the heap.
-    /// No-op when the user has not (yet) invoked the L-BFGS step at
-    /// all, since the LBFGSState object is allocated lazily.
+    /// Forget the L-BFGS history: the curvature pairs it holds refer to
+    /// an iterate or a DOF set that is no longer current.
     void clear_lbfgs_state_() {
-      lbfgs_.reset();
+      lbfgs_ = LBFGSState();
     }
 
     /// L-BFGS two-loop recursion applied to the current gradient ctx.g,
@@ -3420,9 +3420,9 @@ namespace OpenOrbitalOptimizer {
     /// Hessian built from the stored (s_i, y_i, rho_i) triples.
     Vector<Tbase> lbfgs_direction_(
         const RotationStepContext & ctx, Tbase sigma) const {
-      const auto & s = lbfgs_->s;
-      const auto & y = lbfgs_->y;
-      const auto & rho = lbfgs_->rho;
+      const auto & s = lbfgs_.s;
+      const auto & y = lbfgs_.y;
+      const auto & rho = lbfgs_.rho;
       Vector<Tbase> q = ctx.g;
       size_t m = s.size();
       std::vector<Tbase> alpha(m);
@@ -3447,12 +3447,12 @@ namespace OpenOrbitalOptimizer {
     /// still descends. Otherwise leave d as preconditioned SD.
     void apply_lbfgs_correction_(Vector<Tbase> & d,
                                  const RotationStepContext & ctx) const {
-      if(!lbfgs_ || lbfgs_->s.empty()) return;
-      if(lbfgs_->history_dofs != ctx.dofs) return;
+      if(lbfgs_.s.empty()) return;
+      if(lbfgs_.history_dofs != ctx.dofs) return;
       Vector<Tbase> d_lbfgs = lbfgs_direction_(ctx, initial_level_shift_);
       if(d_lbfgs.dot(ctx.g) < 0) {
         log_(5, "L-BFGS: applying two-loop direction (history size %zu).\n",
-               lbfgs_->s.size());
+               lbfgs_.s.size());
         d = d_lbfgs;
       } else if(verbosity_ >= 5) {
         log_(5, "L-BFGS: two-loop direction not descent, resetting to preconditioned SD.\n");
@@ -3462,14 +3462,11 @@ namespace OpenOrbitalOptimizer {
     /// L-BFGS step on the orbital rotations. Mirrors
     /// scaled_steepest_descent_step but builds the trial-1 direction
     /// from a limited-memory BFGS approximation to the inverse Hessian
-    /// rather than from PR+ CG. The LBFGSState struct is allocated
-    /// lazily on the first call, so callers that never enable L-BFGS
-    /// do not pay for the deque headers.
+    /// rather than from PR+ CG.
     bool lbfgs_step() {
       RotationStepContext ctx;
       if(!build_rotation_step_context_(ctx)) return false;
-      if(!lbfgs_) lbfgs_ = std::make_unique<LBFGSState>();
-      LBFGSState & st = *lbfgs_;
+      LBFGSState & st = lbfgs_;
 
       // Promote the pending (s, g_prev) into a full (s, y) history
       // pair using the current gradient, but only if the DOF set is
@@ -3493,14 +3490,10 @@ namespace OpenOrbitalOptimizer {
         }
       } else if(!st.history_dofs.empty() && st.history_dofs != ctx.dofs) {
         clear_lbfgs_state_();
-        lbfgs_ = std::make_unique<LBFGSState>();
-        // st reference is now dangling -- rebind below if we keep using it.
       }
       // Pending pair has been consumed; clear it before this step.
-      if(lbfgs_) {
-        lbfgs_->pending_s.resize(0);
-        lbfgs_->pending_g.resize(0);
-      }
+      st.pending_s.resize(0);
+      st.pending_g.resize(0);
 
       Vector<Tbase> d_accepted;
       bool success = sigma_line_search_(
@@ -3514,10 +3507,9 @@ namespace OpenOrbitalOptimizer {
           "L-BFGS");
 
       if(success) {
-        if(!lbfgs_) lbfgs_ = std::make_unique<LBFGSState>();
-        lbfgs_->pending_s = d_accepted;
-        lbfgs_->pending_g = ctx.g;
-        lbfgs_->history_dofs = ctx.dofs;
+        st.pending_s = d_accepted;
+        st.pending_g = ctx.g;
+        st.history_dofs = ctx.dofs;
       } else {
         clear_lbfgs_state_();
       }
