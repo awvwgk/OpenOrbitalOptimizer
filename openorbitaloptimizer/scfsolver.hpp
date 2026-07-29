@@ -187,11 +187,12 @@ namespace OpenOrbitalOptimizer {
     ///
     /// It records each setting's offset from the registry rather than
     /// its address. An address would belong to the object the setting
-    /// was constructed in, and SCFSolver is movable, so a registry of
-    /// addresses would point into the moved-from object. Offsets
-    /// describe the class layout instead, which is by definition the
-    /// same in the moved-to object, so the implicitly generated move
-    /// stays correct and needs no fixup.
+    /// was constructed in, and SCFSolver is copyable and movable, so a
+    /// registry of addresses would point into the source object.
+    /// Offsets describe the class layout instead, which is by
+    /// definition the same in the destination object, so the
+    /// implicitly generated copy and move stay correct and need no
+    /// fixup.
     class SettingRegistry {
     public:
       /// Called by each Setting's constructor. The conversion to
@@ -328,8 +329,8 @@ namespace OpenOrbitalOptimizer {
     /// joined with " + ".
     Setting<std::string> methods_{
         settings_, "methods",
-        "SCF method mix consumed by run(); e.g. \"DIIS + ODA + CG\", \"DIIS\", \"LCIIS + ODA + CG\", \"ODA + CG\", \"DIIS + ODA + LBFGS\"",
-        "DIIS + ODA + CG",
+        "SCF method mix consumed by run(); e.g. \"DIIS + ODA + LBFGS\", \"DIIS\", \"LCIIS + ODA + CG\", \"ODA + CG\", \"DIIS + ODA + CG\"",
+        "DIIS + ODA + LBFGS",
         true,
         &SCFSolver::canonicalise_methods_};
 
@@ -624,9 +625,10 @@ namespace OpenOrbitalOptimizer {
     /// y = g_new - g_old pair can be formed on entry to the next call.
     /// All members are cleared whenever the orbital basis changes
     /// globally (ODA accept), the line search fails, or the DOF set
-    /// changes. The owning solver only allocates the struct on the
-    /// first lbfgs_step() call, so when the user has not enabled
-    /// L-BFGS the deque headers are not present at all.
+    /// changes. An empty state costs six empty container headers and
+    /// no heap allocation, so it is held by value: a pointer would buy
+    /// nothing but a null check at every use and the risk of a
+    /// dangling reference when the state is reset mid-step.
     struct LBFGSState {
       std::deque<Vector<Tbase>> s;
       std::deque<Vector<Tbase>> y;
@@ -635,7 +637,7 @@ namespace OpenOrbitalOptimizer {
       Vector<Tbase> pending_g;
       std::vector<OrbitalRotation> history_dofs;
     };
-    std::unique_ptr<LBFGSState> lbfgs_;
+    LBFGSState lbfgs_;
 
     /// Method-mix flags parsed from methods_. Shared by run() and the
     /// validator in set("methods", ...).
@@ -3023,17 +3025,12 @@ namespace OpenOrbitalOptimizer {
 
       if(overall_succ) {
         // ODA has globally rearranged the orbital basis (and possibly
-        // the occupation pattern); the recorded PR+ CG state is no
-        // longer tied to the current iterate. The lazy L-BFGS state
-        // is also released if it was allocated; clear_lbfgs_state_()
-        // is a no-op when L-BFGS has not been used.
+        // the occupation pattern), so the orbital-rotation history no
+        // longer describes the current iterate.
         // The end-of-iteration cleanup() in run() runs the density-
         // matrix-difference pruning; doing it here too would print the
         // "Density matrix difference ..." line twice per ODA iteration.
-        previous_orbital_gradient_.resize(0);
-        previous_orbital_direction_.resize(0);
-        previous_orbital_dofs_.clear();
-        clear_lbfgs_state_();
+        clear_orbital_rotation_history_();
       }
       // Update the active-rotation count seen at the new iterate so the
       // outer state machine can size its orbital-rotation burst from it.
@@ -3313,11 +3310,17 @@ namespace OpenOrbitalOptimizer {
     ///     direction itself is suspect; raise sigma (geometric or
     ///     cubic-Hermite-in-sigma when first-trial slope data is on
     ///     hand) and rebuild the preconditioned SD direction.
-    /// Returns true and writes d_accepted on success.
+    /// Returns true on success, writing the accepted direction to
+    /// d_accepted and the step length taken along it to t_accepted.
+    /// The two are reported separately because callers want different
+    /// things: the CG recursion conjugates against the previous
+    /// direction, whereas L-BFGS needs the displacement t*d that the
+    /// step actually made in parameter space.
     template<typename Trial0DirectionFunc>
     bool sigma_line_search_(const RotationStepContext & ctx,
                             Trial0DirectionFunc trial_0_direction,
                             Vector<Tbase> & d_accepted,
+                            Tbase & t_accepted,
                             const char * tag) {
       const Tbase sigma_0 = initial_level_shift_;
       const int max_sigma_trials = 3;
@@ -3369,6 +3372,7 @@ namespace OpenOrbitalOptimizer {
           if(E_t < ctx.E_ref) {
             add_entry(trial_result.first, trial_result.second);
             d_accepted = d;
+            t_accepted = t;
             success = true;
             break;
           }
@@ -3493,6 +3497,7 @@ namespace OpenOrbitalOptimizer {
       if(!build_rotation_step_context_(ctx)) return false;
 
       Vector<Tbase> d_accepted;
+      Tbase t_accepted = 0;
       bool success = sigma_line_search_(
           ctx,
           [&](Tbase sigma) {
@@ -3501,6 +3506,7 @@ namespace OpenOrbitalOptimizer {
             return d;
           },
           d_accepted,
+          t_accepted,
           "Scaled SD");
 
       if(success) {
@@ -3515,11 +3521,21 @@ namespace OpenOrbitalOptimizer {
       return success;
     }
 
-    /// Release the L-BFGS state, returning its storage to the heap.
-    /// No-op when the user has not (yet) invoked the L-BFGS step at
-    /// all, since the LBFGSState object is allocated lazily.
-    void clear_lbfgs_state_() {
-      lbfgs_.reset();
+    /// Forget everything the orbital-rotation steps carry between
+    /// calls -- the PR+ CG direction and the L-BFGS curvature pairs.
+    ///
+    /// Both describe a trajectory of successive rotation steps, so
+    /// they are only meaningful while the rotations are the only thing
+    /// moving the iterate. Whenever another method (an accepted ODA
+    /// step, an accepted extrapolation) relocates it, the recorded
+    /// gradient belongs to a point the solver has left, and the next
+    /// y = g_new - g_old would be measured across that jump as well as
+    /// across the rotation.
+    void clear_orbital_rotation_history_() {
+      previous_orbital_gradient_.resize(0);
+      previous_orbital_direction_.resize(0);
+      previous_orbital_dofs_.clear();
+      lbfgs_ = LBFGSState();
     }
 
     /// L-BFGS two-loop recursion applied to the current gradient ctx.g,
@@ -3529,9 +3545,9 @@ namespace OpenOrbitalOptimizer {
     /// Hessian built from the stored (s_i, y_i, rho_i) triples.
     Vector<Tbase> lbfgs_direction_(
         const RotationStepContext & ctx, Tbase sigma) const {
-      const auto & s = lbfgs_->s;
-      const auto & y = lbfgs_->y;
-      const auto & rho = lbfgs_->rho;
+      const auto & s = lbfgs_.s;
+      const auto & y = lbfgs_.y;
+      const auto & rho = lbfgs_.rho;
       Vector<Tbase> q = ctx.g;
       size_t m = s.size();
       std::vector<Tbase> alpha(m);
@@ -3549,36 +3565,61 @@ namespace OpenOrbitalOptimizer {
       return -r;
     }
 
+    /// Fraction of the preconditioned-SD descent rate that the L-BFGS
+    /// two-loop direction has to retain to be worth taking; see
+    /// apply_lbfgs_correction_.
+    ///
+    /// Fitted on O/PBE/cc-pVDZ at M = 1 and M = 3 over the mixes that
+    /// exercise the two-loop direction hardest, the ones without ODA
+    /// to re-anchor the iterate. Requiring nothing beyond descent
+    /// (the equivalent of 0) leaves "DIIS + LBFGS" needing 200
+    /// iterations at M = 3 and bare "LBFGS" not converging at all;
+    /// 0.2, 0.5 and 0.8 take that case to 22, 15 and 13 iterations
+    /// respectively, but 0.8 is tight enough to stall bare "LBFGS" at
+    /// M = 1, which 0.5 converges in 31. Mixes containing ODA are
+    /// insensitive across the whole range. 0.5 is thus the strictest
+    /// setting that leaves every tested configuration converging.
+    static constexpr Tbase lbfgs_minimum_relative_descent_ = Tbase(0.5);
+
     /// Apply the L-BFGS correction to d in place. d on entry is the
     /// preconditioned-SD direction (L-BFGS with empty history); replace
     /// it with the full two-loop direction when the stored history is
-    /// compatible with the current DOFs and the resulting direction
-    /// still descends. Otherwise leave d as preconditioned SD.
+    /// compatible with the current DOFs and the two-loop direction is
+    /// the better of the two. Otherwise leave d as preconditioned SD.
+    ///
+    /// "Better" is measured as the descent rate per unit step length,
+    /// d.g/|d|, which is what the line search along exp(t K) actually
+    /// gets to spend: a direction may descend and still be a poor
+    /// trade if it descends far more slowly for its length than the
+    /// direction it displaces. Merely requiring d.g < 0 admits exactly
+    /// that, and the curvature history then compounds it, since the
+    /// step it produces becomes the next s.
     void apply_lbfgs_correction_(Vector<Tbase> & d,
                                  const RotationStepContext & ctx) const {
-      if(!lbfgs_ || lbfgs_->s.empty()) return;
-      if(lbfgs_->history_dofs != ctx.dofs) return;
+      if(lbfgs_.s.empty()) return;
+      if(lbfgs_.history_dofs != ctx.dofs) return;
       Vector<Tbase> d_lbfgs = lbfgs_direction_(ctx, initial_level_shift_);
-      if(d_lbfgs.dot(ctx.g) < 0) {
+      Tbase rate_lbfgs = -d_lbfgs.dot(ctx.g) / d_lbfgs.norm();
+      Tbase rate_sd = -d.dot(ctx.g) / d.norm();
+      if(rate_lbfgs >= lbfgs_minimum_relative_descent_ * rate_sd) {
         log_(5, "L-BFGS: applying two-loop direction (history size %zu).\n",
-               lbfgs_->s.size());
+               lbfgs_.s.size());
         d = d_lbfgs;
       } else if(verbosity_ >= 5) {
-        log_(5, "L-BFGS: two-loop direction not descent, resetting to preconditioned SD.\n");
+        log_(5, "L-BFGS: two-loop direction descends at %e per unit length "
+                "against preconditioned SD's %e, keeping SD.\n",
+             (double) (rate_lbfgs), (double) (rate_sd));
       }
     }
 
     /// L-BFGS step on the orbital rotations. Mirrors
     /// scaled_steepest_descent_step but builds the trial-1 direction
     /// from a limited-memory BFGS approximation to the inverse Hessian
-    /// rather than from PR+ CG. The LBFGSState struct is allocated
-    /// lazily on the first call, so callers that never enable L-BFGS
-    /// do not pay for the deque headers.
+    /// rather than from PR+ CG.
     bool lbfgs_step() {
       RotationStepContext ctx;
       if(!build_rotation_step_context_(ctx)) return false;
-      if(!lbfgs_) lbfgs_ = std::make_unique<LBFGSState>();
-      LBFGSState & st = *lbfgs_;
+      LBFGSState & st = lbfgs_;
 
       // Promote the pending (s, g_prev) into a full (s, y) history
       // pair using the current gradient, but only if the DOF set is
@@ -3601,17 +3642,14 @@ namespace OpenOrbitalOptimizer {
           log_(5, "L-BFGS: curvature condition violated (y.s = %e), pair dropped.\n", (double) (ys));
         }
       } else if(!st.history_dofs.empty() && st.history_dofs != ctx.dofs) {
-        clear_lbfgs_state_();
-        lbfgs_ = std::make_unique<LBFGSState>();
-        // st reference is now dangling -- rebind below if we keep using it.
+        st = LBFGSState();
       }
       // Pending pair has been consumed; clear it before this step.
-      if(lbfgs_) {
-        lbfgs_->pending_s.resize(0);
-        lbfgs_->pending_g.resize(0);
-      }
+      st.pending_s.resize(0);
+      st.pending_g.resize(0);
 
       Vector<Tbase> d_accepted;
+      Tbase t_accepted = 0;
       bool success = sigma_line_search_(
           ctx,
           [&](Tbase sigma) {
@@ -3620,15 +3658,19 @@ namespace OpenOrbitalOptimizer {
             return d;
           },
           d_accepted,
+          t_accepted,
           "L-BFGS");
 
       if(success) {
-        if(!lbfgs_) lbfgs_ = std::make_unique<LBFGSState>();
-        lbfgs_->pending_s = d_accepted;
-        lbfgs_->pending_g = ctx.g;
-        lbfgs_->history_dofs = ctx.dofs;
+        // s is the displacement the step actually made, t*d, not the
+        // direction d: the gradient difference y that pairs with it was
+        // measured across exp(t*K), and the line search routinely
+        // accepts t several orders of magnitude away from 1.
+        st.pending_s = t_accepted * d_accepted;
+        st.pending_g = ctx.g;
+        st.history_dofs = ctx.dofs;
       } else {
-        clear_lbfgs_state_();
+        st = LBFGSState();
       }
       return success;
     }
@@ -4544,14 +4586,14 @@ namespace OpenOrbitalOptimizer {
     /// matrices), and ``"CG"`` (preconditioned PR+ scaled steepest
     /// descent on orbital rotations at fixed occupations).
     /// Configure via ``set("methods", ...)``; default is
-    /// ``"DIIS + ODA + CG"``. Examples:
+    /// ``"DIIS + ODA + LBFGS"``. Examples:
     ///
     ///   ``"DIIS"``                pure A/EDIIS extrapolation
     ///   ``"LCIIS"``               least-squares commutator extrapolation
     ///   ``"ODA"``                 standalone polytope minimisation
-    ///   ``"DIIS + ODA + CG"``     full compound algorithm (default)
+    ///   ``"DIIS + ODA + LBFGS"``  full compound algorithm (default)
+    ///   ``"DIIS + ODA + CG"``     PR+ CG in place of L-BFGS
     ///   ``"ODA + CG"``            DIIS-less compound
-    ///   ``"DIIS + ODA + LBFGS"``  L-BFGS in place of PR+ CG
     ///
     /// State-transition rules: from DIIS we leave to ODA (or to CG when
     /// ODA is not allowed) on stall or large error; from ODA we hand
@@ -4955,6 +4997,9 @@ namespace OpenOrbitalOptimizer {
           } else {
             failed_iterations=0;
             oda_failed = rotation_failed = false;
+            // The extrapolation moved the iterate, so the recorded
+            // rotation trajectory no longer leads to it.
+            clear_orbital_rotation_history_();
           }
           // Stay in DIIS; the pre-step check at the top of the next
           // iteration will move us to ODA / CG if DIIS keeps stalling.

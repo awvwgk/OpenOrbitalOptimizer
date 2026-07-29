@@ -285,6 +285,15 @@ int main() {
     }
   }
 
+  // The documented default method mix. Nothing else pins it: the
+  // atomtest runs pass --methods, and every check below sets the value
+  // before reading it, so a default that drifted away from what the
+  // docstring and changelog promise would go unnoticed.
+  {
+    auto s = make_solver();
+    REQUIRE(s.get_string("methods") == "DIIS + ODA + LBFGS");
+  }
+
   // LCIIS method token. LCIIS is a variant of the extrapolation step
   // rather than a step of its own, so the token has to imply DIIS --
   // every state-machine gate gets asked "is DIIS allowed?", never
