@@ -58,6 +58,13 @@
   exercised from the command line.
 
 #### Breaking Changes
+* The default method mix is now ``"DIIS + ODA + LBFGS"`` rather than
+  ``"DIIS + ODA + CG"``: the orbital-rotation step is taken by L-BFGS
+  instead of preconditioned PR+ CG. Callers that relied on the old
+  default can ask for it explicitly with
+  ``set("methods", "DIIS + ODA + CG")``. The Armadillo shim's
+  ``run()`` default argument and the Python binding's documented
+  default follow suit.
 * Requesting two methods that occupy the same slot now throws
   instead of silently resolving to one of them. This affects
   ``"CG + LBFGS"``, which previously ran L-BFGS and quietly ignored
@@ -313,6 +320,33 @@
   Armadillo compatibility shim.
 
 #### Bug Fixes
+* L-BFGS no longer stalls when combined with ODA. On open-shell
+  oxygen (PBE/cc-pVDZ, M = 3) ``"ODA + LBFGS"`` used to exhaust
+  1000 iterations at −74.1255 Eh, 0.85 Eh above the answer that
+  ``"ODA + CG"`` reached in 24; it now converges in 26 to the same
+  −74.9722875549 Eh. Three defects contributed, each fixed:
+    - The curvature pair recorded the search *direction* ``d`` as
+      its ``s``, but the step taken is ``exp(t K)``, a displacement
+      of ``t*d``. The paired ``y = g_new - g_old`` was therefore
+      measured across a different displacement than ``s``
+      described. Since the line search routinely accepts ``t``
+      orders of magnitude away from 1 -- 1.4e-8 in the stalling
+      run -- the stored pairs were inconsistent with each other by
+      the same orders of magnitude, and the resulting two-loop
+      direction exceeded the preconditioned-SD one in length by up
+      to a factor of 5.7e6.
+    - Neither the L-BFGS history nor the PR+ CG direction was
+      cleared after an accepted extrapolation, so the recorded
+      gradient belonged to the pre-extrapolation iterate and the
+      next ``y`` spanned the DIIS jump as well as the rotation.
+      ODA accepts already cleared it; DIIS accepts now do too.
+      This is what left ``"DIIS + LBFGS"`` needing 200 iterations
+      at M = 3, now 15.
+    - The two-loop direction replaced the preconditioned-SD one on
+      the strength of ``d.g < 0`` alone. Descending is not the same
+      as being worth taking: the direction it displaced routinely
+      descended several times faster per unit length. The
+      replacement now has to retain at least half that rate.
 * ODA no longer aborts with "Negative natural occupation numbers"
   on an SCF started from a density projected between two
   different basis sets. Two independent problems fed the same
