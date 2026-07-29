@@ -3412,12 +3412,6 @@ namespace OpenOrbitalOptimizer {
       return success;
     }
 
-    /// Forget the L-BFGS history: the curvature pairs it holds refer to
-    /// an iterate or a DOF set that is no longer current.
-    void clear_lbfgs_state_() {
-      lbfgs_ = LBFGSState();
-    }
-
     /// Forget everything the orbital-rotation steps carry between
     /// calls -- the PR+ CG direction and the L-BFGS curvature pairs.
     ///
@@ -3432,7 +3426,7 @@ namespace OpenOrbitalOptimizer {
       previous_orbital_gradient_.resize(0);
       previous_orbital_direction_.resize(0);
       previous_orbital_dofs_.clear();
-      clear_lbfgs_state_();
+      lbfgs_ = LBFGSState();
     }
 
     /// L-BFGS two-loop recursion applied to the current gradient ctx.g,
@@ -3539,7 +3533,7 @@ namespace OpenOrbitalOptimizer {
           log_(5, "L-BFGS: curvature condition violated (y.s = %e), pair dropped.\n", (double) (ys));
         }
       } else if(!st.history_dofs.empty() && st.history_dofs != ctx.dofs) {
-        clear_lbfgs_state_();
+        st = LBFGSState();
       }
       // Pending pair has been consumed; clear it before this step.
       st.pending_s.resize(0);
@@ -3567,7 +3561,7 @@ namespace OpenOrbitalOptimizer {
         st.pending_g = ctx.g;
         st.history_dofs = ctx.dofs;
       } else {
-        clear_lbfgs_state_();
+        st = LBFGSState();
       }
       return success;
     }
