@@ -313,6 +313,35 @@
   Armadillo compatibility shim.
 
 #### Bug Fixes
+* The occupations reported at convergence are now Aufbau: full below
+  the Fermi level, exactly zero above it, fractional only inside the
+  degenerate cluster at it. What was reported before was the natural
+  occupation vector of a *mixed* density, and a mixture of densities
+  carrying different orbitals is not idempotent shell by shell, so a
+  nominally full shell came out at ``max_occ - epsilon`` and orbitals
+  well above the Fermi level carried ``epsilon``.
+    - At convergence the SCF takes one more ODA step with the current
+      density left out of the polytope. That is the whole fix, because
+      the mixing is the whole problem: every skeleton is an Aufbau
+      filling of one common set of orbitals, so a combination of
+      skeletons alone has those orbitals as its natural orbitals and
+      the combined occupation vector as its occupations, exactly. The
+      Aufbau structure is inherited rather than imposed, and the
+      Fermi-level fractions come from minimising the energy over the
+      skeleton simplex rather than from a filling rule.
+    - Leaving the reference out is a reparametrisation rather than a
+      new code path: one skeleton is promoted to the ``lambda = 0``
+      vertex and dropped from the axes, so ``n`` skeletons are
+      described by ``n-1`` parameters -- the simplex they span. The
+      polytope is still ``{lambda >= 0, sum(lambda) <= 1}``, so the
+      QP, the cubic rays and the backoff scaling are untouched.
+    - Largest occupation above the Fermi level at convergence, oxygen
+      with PBE/cc-pVDZ: 6.6e-12 to 0 (M=3) and 2.0e-12 to 0 (M=1),
+      with the deviation of full shells from ``max_occ`` following.
+      Reference energies are unchanged, M=3 by a digit in its favour.
+* ``interpolate_density`` no longer hands back a density with
+  default-constructed blocks for a particle that has no trial
+  occupations; it copies the reference across instead.
 * ODA no longer loses particle number. The mixed density's natural
   occupations were snapped to exactly zero below
   ``sqrt(eps) * max_occ`` -- 3.0e-8 for an s block, 2.1e-7 for an f
