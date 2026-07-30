@@ -353,6 +353,59 @@
   Armadillo compatibility shim.
 
 #### Bug Fixes
+* The Aufbau cleanup is no longer rejected on atoms with a fractionally
+  occupied Fermi level. It swapped the occupation vector but judged it
+  on orbitals that were relaxed for the *old* occupations, so it lost
+  to the converged mixed density every time and was discarded --
+  silently, its return value being dropped. The occupations reported
+  stayed the mixed ones, Rydberg tail and all.
+    - The step now relaxes the orbitals at the occupations it chose,
+      to stationarity, and compares only the relaxed energy. On iron
+      (PBE/cc-pVDZ) that alone took the gap from 1.64e-2 Eh to
+      9.74e-4.
+    - The skeleton set is established once and held fixed across the
+      cleanup's passes. Which orbitals are degenerate is a property of
+      the solution being refined, and re-deriving it from each relaxed
+      iterate destroyed it: the relaxation moves the cluster apart by
+      more than ``optimal_damping_degeneracy_threshold``, after which
+      the walk no longer recognises it and hands back a simplex of
+      dimension zero.
+    - What was left was a curvature the model could not see. ODA
+      expands the energy in the occupations at *fixed* orbitals, so it
+      misses the response term in
+      ``H_relaxed = H_ll - H_lk H_kk^-1 H_kl``, and being too stiff it
+      stops short: on iron it put the beta 4s/3d split at 0.826/1.174
+      where the SCF finds 0.657/1.343 -- both on the same
+      one-parameter line, so this was never a missing degree of
+      freedom. Alternating the two halves does not recover it either;
+      each is exact given the other, so the alternation has a fixed
+      point and sits down at it.
+    - Where the Fermi level is a single degenerate pair, the cleanup
+      now models the coupling. It relaxes at the sampled points and
+      fits a cubic through relaxed data rather than forming the Schur
+      complement, which would need orbital response equations the
+      solver does not have. The endpoint slopes are free: at an
+      orbital-stationary point the orbital-response contribution to
+      ``dE/dlambda`` carries a factor ``dE/dkappa = 0``, leaving
+      Hellmann-Feynman.
+    - Iron's minimum now lands at lambda = 0.6596, against the SCF's
+      0.6567, and reaches 1.3e-6 Eh *below* the converged mixed
+      density, so the cleanup is accepted and the reported occupations
+      are Aufbau. Oxygen accepts at M = 1, 3 and 5 across three method
+      mixes with the reference energies unchanged.
+    - This stays out of the SCF loop deliberately: it cost about 100
+      Fock builds on iron against 576 for the whole run, the loop
+      already performs the alternation across its iterations, and the
+      free-slope argument holds only at a stationary point.
+    - Fermi levels spanning more than two orbitals still fall back to
+      the alternation and may still be rejected.
+* ``atomtest`` accepts functional id 0. Libxc numbers its functionals
+  from one, so a non-positive id means "nothing to add here" -- 0 as
+  written by someone wanting exchange only, -1 as returned by
+  ``xc_functional_get_number`` for a name it does not know. Only -1 was
+  honoured, and only in two of the three builders, so ``--xfunc 0``
+  threw and NEO without an electron-proton correlation functional could
+  not run at all.
 * The occupations reported at convergence are now Aufbau: full below
   the Fermi level, exactly zero above it, fractional only inside the
   degenerate cluster at it. What was reported before was the natural
