@@ -399,6 +399,10 @@
       free-slope argument holds only at a stationary point.
     - Fermi levels spanning more than two orbitals still fall back to
       the alternation and may still be rejected.
+* ``atomtest`` gained ``--M 0``, which runs the spin-restricted code
+  whatever the shell structure and gives an open shell a fractionally
+  occupied Fermi level rather than refusing it. The ``restricted``
+  flag it supersedes is removed; it was computed and never read.
 * ``atomtest`` accepts functional id 0. Libxc numbers its functionals
   from one, so a non-positive id means "nothing to add here" -- 0 as
   written by someone wanting exchange only, -1 as returned by
