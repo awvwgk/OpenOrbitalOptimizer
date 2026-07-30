@@ -2325,8 +2325,18 @@ namespace OpenOrbitalOptimizer {
     /// combination of such fillings -- full below the Fermi level,
     /// zero above it, fractional only inside the degenerate cluster
     /// the Fermi level lands in. See ``aufbau_cleanup_step``.
+    /// ``best_evaluated`` receives the lowest-energy density this step
+    /// built, whether or not it beat the reference and so whether or
+    /// not the step reports success. The Aufbau cleanup needs it: the
+    /// occupations it wants are the simplex optimum, which loses to
+    /// the converged density until the orbitals have been relaxed at
+    /// them, so it would otherwise be discarded before the relaxation
+    /// that justifies it could run.
     bool optimal_damping_step(bool force_full = false,
-                              bool exclude_reference = false) {
+                              bool exclude_reference = false,
+                              std::pair<DensityMatrix<Torb, Tbase>,
+                                        FockBuilderReturn<Torb, Tbase>>
+                                * best_evaluated = nullptr) {
       auto particles_left = [](Tbase n) {
         return n >= 10*std::numeric_limits<Tbase>::epsilon();
       };
@@ -2565,6 +2575,10 @@ namespace OpenOrbitalOptimizer {
           // for the solution like any other trial this step evaluates.
           add_entry(std::make_pair(reference_orbitals, reference_occupations),
                     reference_build);
+          if(best_evaluated)
+            *best_evaluated = std::make_pair(
+                std::make_pair(reference_orbitals, reference_occupations),
+                reference_build);
           log_(5, "Aufbau cleanup: lambda = 0 vertex is now a skeleton, "
                   "energy % .10f\n", (double) (reference_energy));
         }
@@ -2959,6 +2973,9 @@ namespace OpenOrbitalOptimizer {
             Vector<Tbase> x_scaled = scale * cand.lam;
             auto eval = evaluate(x_scaled);
             number_of_fock_evaluations_++;
+            if(best_evaluated
+               && eval.second.first < best_evaluated->second.first)
+              *best_evaluated = eval;
             bool ok = add_entry(eval.first, eval.second);
             if(ok) {
               succ = true;
@@ -4596,14 +4613,171 @@ namespace OpenOrbitalOptimizer {
     /// a cleanup that raised it would mean the converged iterate was
     /// not the Aufbau minimiser it is reported to be, which is worth
     /// leaving visible rather than papering over.
-    bool aufbau_cleanup_step() {
+    /// Relax the orbitals at the occupations the iterate already
+    /// carries, the way the state machine does after an ODA step.
+    /// Runs the same burst, and stops early once a rotation step
+    /// stops descending.
+    void relax_orbitals_at_fixed_occupations_(const AllowedMethods & allowed) {
+      if(!allowed.orbital_rotation()) return;
+      // The rotation step works at fixed occupations by construction;
+      // freezing them as well keeps anything it calls from quietly
+      // re-Aufbau-filling and undoing the choice being tested.
+      struct FrozenGuard {
+        Setting<int> * flag;
+        int saved;
+        ~FrozenGuard() { *flag = saved; }
+      } guard{&frozen_occupations_, frozen_occupations_};
+      frozen_occupations_ = 1;
+
+      // Relax to stationarity rather than for a fixed burst. The
+      // rotation step reports failure once it can no longer descend,
+      // which is the natural stopping point; the cap is only there so
+      // a pathological case cannot spin. A burst sized for the usual
+      // post-ODA relaxation is far too short here -- the occupations
+      // have just moved by a finite amount, not a converged step's
+      // worth, and it is the fully relaxed energy that decides whether
+      // the new occupations are worth adopting at all.
+      const size_t maximum_steps = 100;
+      for(size_t step = 0; step < maximum_steps; step++)
+        if(!(allowed.lbfgs ? lbfgs_step() : scaled_steepest_descent_step()))
+          break;
+    }
+
+    /// Replace the converged iterate's occupations with an Aufbau
+    /// filling, relaxing the orbitals at those occupations before
+    /// judging whether the swap was worth making.
+    ///
+    /// What the SCF converges to is the natural occupation vector of a
+    /// *mixed* density. A mixture of densities carrying different
+    /// orbitals is not idempotent shell by shell, so a nominally full
+    /// shell comes out at max_occ - epsilon and orbitals far above the
+    /// Fermi level carry epsilon -- even though the minimiser of a
+    /// fractional-occupation functional is Aufbau.
+    ///
+    /// Both halves are needed and neither works alone. Choosing
+    /// occupations is an ODA step over the skeletons with the current
+    /// density excluded, which keeps the result Aufbau: every skeleton
+    /// is an Aufbau filling of one common set of orbitals, so any
+    /// combination of them has those orbitals as its natural orbitals
+    /// and the combined vector as its occupations, exactly. But an
+    /// occupation vector evaluated on orbitals that were relaxed for
+    /// the *previous* occupations loses to the converged density every
+    /// time -- by 1e-4 to 2e-2 Eh on the atoms this was measured on --
+    /// so without the relaxation the step is a no-op that silently
+    /// changes nothing.
+    ///
+    /// The two alternate until neither buys anything, which makes this
+    /// a small SCF restricted to Aufbau-occupied densities. It runs on
+    /// a scratch iterate seeded from the converged Fock matrix, so
+    /// that the history holds nothing but Aufbau states and its
+    /// lowest-energy entry is the best of them rather than the mixed
+    /// density -- which is what makes the final comparison possible at
+    /// all, the history being kept sorted by energy.
+    ///
+    /// The result is adopted only if it does not cost energy. Losing
+    /// after relaxation would say the mixed density sits below every
+    /// Aufbau-occupied state, which a variational fractional-occupation
+    /// functional should not permit, so the rejection is reported
+    /// rather than passed over in silence.
+    bool aufbau_cleanup_step(const AllowedMethods & allowed) {
       if(frozen_occupations_) {
         log_(5, "Aufbau cleanup skipped: occupations are frozen.\n");
         return false;
       }
-      log_(5, "Aufbau cleanup: ODA over the skeletons alone.\n");
-      return optimal_damping_step(/*force_full=*/true,
-                                  /*exclude_reference=*/true);
+      log_(5, "Aufbau cleanup: choosing occupations, then relaxing at them.\n");
+
+      // Everything below runs on a scratch iterate; keep what it would
+      // otherwise overwrite.
+      const auto saved_history = orbital_history_;
+      const Tbase reference_energy = get_energy();
+      const int saved_fock_evaluations = number_of_fock_evaluations_;
+      const auto saved_cg_gradient = previous_orbital_gradient_;
+      const auto saved_cg_direction = previous_orbital_direction_;
+      const auto saved_cg_dofs = previous_orbital_dofs_;
+      const auto saved_lbfgs = lbfgs_;
+
+      // initialize_with_orbitals resets the Fock counter, so the count
+      // has to be banked before each pass wipes it.
+      int cleanup_fock_evaluations = 0;
+
+      // Best Aufbau state found so far, kept explicitly: a pass can
+      // land below the one before it -- once the occupations stop
+      // being fractional the skeleton simplex collapses to a point and
+      // the step falls back on a plain Aufbau fill, which breaks the
+      // symmetry of the degenerate shell and costs far more than the
+      // pass was going to win -- and the answer must not follow it
+      // down.
+      DensityMatrix<Torb, Tbase> best_state;
+      Tbase best_energy = std::numeric_limits<Tbase>::infinity();
+
+      const size_t maximum_passes = 4;
+      for(size_t pass = 0; pass < maximum_passes; pass++) {
+        // Choose occupations on the skeleton simplex. The search has
+        // to run at the state we are standing on, because that is what
+        // fixes the degenerate cluster the skeletons are built from --
+        // seeding it with a plain Aufbau fill instead would put the
+        // whole fractional remainder on one orbital, leave no
+        // partially filled cluster, and hand back a simplex of
+        // dimension zero with nothing to optimise.
+        std::pair<DensityMatrix<Torb, Tbase>, FockBuilderReturn<Torb, Tbase>>
+          best_aufbau;
+        optimal_damping_step(/*force_full=*/true, /*exclude_reference=*/true,
+                             &best_aufbau);
+        if(best_aufbau.first.first.empty()) break;
+
+        // Stand on it, whether or not it beat what we were standing on
+        // -- it is about to be relaxed, and it is the relaxed energy
+        // that decides. This also makes the history hold nothing but
+        // Aufbau states, so its lowest-energy entry is the best of
+        // those rather than the mixed density we are trying to
+        // improve on.
+        cleanup_fock_evaluations += number_of_fock_evaluations_;
+        initialize_with_orbitals(best_aufbau.first.first,
+                                 best_aufbau.first.second);
+        relax_orbitals_at_fixed_occupations_(allowed);
+
+        // Progress is measured along the Aufbau trajectory, not
+        // against the mixed density we started from: the first pass is
+        // expected to land above it, that being the whole reason the
+        // relaxation is needed.
+        const Tbase now = get_energy();
+        if(now >= best_energy - minimum_useful_descent_()) break;
+        best_energy = now;
+        best_state = get_solution();
+      }
+
+      // Stand on the best pass, not the last one.
+      if(!best_state.first.empty()
+         && get_energy() > best_energy + minimum_useful_descent_()) {
+        cleanup_fock_evaluations += number_of_fock_evaluations_;
+        initialize_with_orbitals(best_state.first, best_state.second);
+      }
+
+      const Tbase aufbau_energy = get_energy();
+      // The scratch passes reset the counter; the Fock builds they made
+      // were real, so fold them back onto the total rather than losing
+      // them.
+      cleanup_fock_evaluations += number_of_fock_evaluations_;
+      number_of_fock_evaluations_ =
+          saved_fock_evaluations + cleanup_fock_evaluations;
+
+      if(aufbau_energy <= reference_energy) {
+        log_(5, "Aufbau cleanup accepted, energy change %e\n",
+             (double) (aufbau_energy - reference_energy));
+        return true;
+      }
+
+      log_(1, "Aufbau cleanup rejected: the relaxed Aufbau state lies %e Eh "
+              "above the converged density, whose mixed occupations are "
+              "reported instead.\n",
+           (double) (aufbau_energy - reference_energy));
+      orbital_history_ = saved_history;
+      clear_diis_caches_();
+      previous_orbital_gradient_ = saved_cg_gradient;
+      previous_orbital_direction_ = saved_cg_direction;
+      previous_orbital_dofs_ = saved_cg_dofs;
+      lbfgs_ = saved_lbfgs;
+      return false;
     }
 
     /// How far the occupations are from carrying the requested number
@@ -5021,13 +5195,26 @@ namespace OpenOrbitalOptimizer {
           // are only Aufbau up to the residual mixing. Report the
           // Aufbau filling of the converged Fock matrix instead, when
           // it does not cost energy.
-          aufbau_cleanup_step();
+          const bool cleanup_adopted = aufbau_cleanup_step(allowed);
 
           // Occupation space gets its say only now, with the cleanup
           // already applied: it is the step that puts the occupations
           // right, so testing before it would block on an error
           // nothing had been allowed to fix.
-          if(!occupations_converged()) {
+          //
+          // A cleanup that was tried and rejected is the end of the
+          // road, though: the same attempt would be made and refused
+          // on every further pass, so blocking on the occupations
+          // would spin to maximum_iterations. Report what is being
+          // handed back and stop.
+          if(!cleanup_adopted && !occupations_converged())
+            log_(0, "Warning: converged occupations carry %e outside the "
+                    "Fermi-level window, above the %e threshold, and the "
+                    "Aufbau cleanup did not improve on them.\n",
+                 (double) (aufbau_error()),
+                 (double) (aufbau_convergence_threshold_.get()));
+
+          if(cleanup_adopted && !occupations_converged()) {
             // Said once at the volume of the iteration line, then
             // demoted, so the extra iterations read as a stated
             // reason rather than as a stall.

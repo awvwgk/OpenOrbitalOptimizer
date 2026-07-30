@@ -79,8 +79,12 @@ namespace OpenOrbitalOptimizer {
     std::tuple<double,std::vector<Eigen::MatrixXd>> build_xc_unpolarized(const std::vector<std::shared_ptr<const RadialBasis>> & basis, const std::vector<Eigen::MatrixXd> & P, size_t N, int func_id) {
       assert(basis.size() == P.size());
 
-      // Handle case of no functional
-      if(func_id==-1) {
+      // Handle case of no functional. Libxc numbers its functionals
+      // from one, so any non-positive id means "nothing to add here":
+      // 0 as written on the command line by someone who wants, say,
+      // exchange only, and -1 as returned by
+      // ``xc_functional_get_number`` for a name it does not know.
+      if(func_id<=0) {
         std::vector<Eigen::MatrixXd> F(basis.size());
         for(size_t l=0;l<basis.size();l++)
           F[l] = Eigen::MatrixXd::Zero(basis[l]->nbf(),basis[l]->nbf());
@@ -168,8 +172,8 @@ namespace OpenOrbitalOptimizer {
       assert(basis.size() == Pa.size());
       assert(basis.size() == Pb.size());
 
-      // Handle case of no functional
-      if(func_id==-1) {
+      // Handle case of no functional; see build_xc_unpolarized.
+      if(func_id<=0) {
         std::vector<Eigen::MatrixXd> Fa(basis.size()), Fb(basis.size());
         for(size_t l=0;l<basis.size();l++) {
           Fa[l] = Eigen::MatrixXd::Zero(basis[l]->nbf(),basis[l]->nbf());
@@ -278,6 +282,18 @@ namespace OpenOrbitalOptimizer {
     std::tuple<double,std::vector<Eigen::MatrixXd>,std::vector<Eigen::MatrixXd>> build_xc_neo(const std::vector<std::shared_ptr<const RadialBasis>> & pbasis, const std::vector<Eigen::MatrixXd> & Pp, const std::vector<std::shared_ptr<const RadialBasis>> & ebasis, const std::vector<Eigen::MatrixXd> & Pe, size_t N, int func_id) {
       assert(pbasis.size() == Pp.size());
       assert(ebasis.size() == Pe.size());
+
+      // Handle case of no functional; see build_xc_unpolarized. This
+      // is the default for the electron-proton correlation, so running
+      // NEO without one has to be allowed.
+      if(func_id<=0) {
+        std::vector<Eigen::MatrixXd> Fp(pbasis.size()), Fe(ebasis.size());
+        for(size_t l=0;l<pbasis.size();l++)
+          Fp[l] = Eigen::MatrixXd::Zero(pbasis[l]->nbf(),pbasis[l]->nbf());
+        for(size_t l=0;l<ebasis.size();l++)
+          Fe[l] = Eigen::MatrixXd::Zero(ebasis[l]->nbf(),ebasis[l]->nbf());
+        return std::make_tuple(0.0,Fp,Fe);
+      }
 
       // Get radial grid
       IntegratorXX::TreutlerAhlrichs<double,double> quad(N);
