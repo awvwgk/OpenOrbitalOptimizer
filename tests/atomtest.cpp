@@ -1125,8 +1125,7 @@ int main(int argc, char **argv) {
   // full option name, no short option, description, argument required
   parser.add<int>("Z", 0, "nuclear charge", true);
   parser.add<int>("Q", 0, "atom's charge", false, 0);
-  parser.add<int>("M", 0, "atom's spin multiplicity", true);
-  parser.add<int>("restricted", 0, "spin restricted operation? -1 for auto", false, -1);
+  parser.add<int>("M", 0, "atom's spin multiplicity; 0 runs the spin-restricted code, which for an open shell means a fractionally occupied Fermi level", true);
   parser.add<int>("Ngrid", 0, "number of radial grid points", false, 2500);
   parser.add<int>("verbosity", 0, "level of verbosity", false, 5);
   parser.add<std::string>("xfunc", 0, "exchange functional", true);
@@ -1148,10 +1147,6 @@ int main(int argc, char **argv) {
   int Z = parser.get<int>("Z");
   int Q = parser.get<int>("Q");
   int M = parser.get<int>("M");
-  int restricted = parser.get<int>("restricted");
-  if(restricted == -1 and M == 1)
-    // Automatic spin-restriction
-    restricted=1;
 
   double linear_dependency_threshold = parser.get<double>("lindepthresh");
   double convergence_threshold = parser.get<double>("convthr");
@@ -1248,7 +1243,13 @@ int main(int argc, char **argv) {
     // electron count alone is not what the occupations sum to.
     OpenOrbitalOptimizer::AtomicSolver::unrestricted_neo_scf(Z, Q, M, x_func_id, c_func_id, epc_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, protonic_basis, proton_mass, verbosity, core_excitation, oda, oda_degeneracy_threshold, maxiter, methods_override);
   } else {
-    if(M==1) {
+    // M = 0 asks for the spin-restricted treatment whatever the shell
+    // structure: one set of orbitals, shell capacities of 2(2l+1), and
+    // the particle number taken as given. An open shell then comes out
+    // with a fractionally occupied Fermi level rather than being
+    // refused, which is what a spherically averaged atom wants and what
+    // the old, unused "restricted" flag was reaching for.
+    if(M<=1) {
       conserved = check_particle_number(
         OpenOrbitalOptimizer::AtomicSolver::restricted_scf(Z, Q, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, core_excitation, oda, oda_degeneracy_threshold, maxiter, methods_override));
     } else {
