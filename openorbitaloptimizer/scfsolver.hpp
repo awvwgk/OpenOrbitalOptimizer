@@ -302,6 +302,30 @@ namespace OpenOrbitalOptimizer {
         settings_, "convergence_threshold",
         "DIIS-error convergence threshold", Tbase(1e-7)};
 
+    /// Occupation-space convergence threshold: how much occupation is
+    /// allowed to sit outside the Fermi-level window before the SCF
+    /// refuses to call itself converged. See ``aufbau_error``.
+    ///
+    /// A converged fractional-occupation solution is Aufbau as a
+    /// matter of theory -- the minimum over the occupation simplex
+    /// fills every orbital below the chemical potential, empties every
+    /// orbital above it, and leaves fractional occupation only where
+    /// the orbital energies are equal to it -- so the honest value of
+    /// this bound is zero and the default only leaves room for
+    /// arithmetic. Measured on oxygen, the error is exactly 0 several
+    /// iterations before the DIIS error reaches its own threshold, so
+    /// the bound does not delay a healthy SCF; it is here to stop an
+    /// unhealthy one reporting occupations that the energy functional
+    /// it just minimised does not actually support.
+    ///
+    /// Set to a negative value to switch the bound off and convergence
+    /// back to the DIIS error alone.
+    Setting<Tbase> aufbau_convergence_threshold_{
+        settings_, "aufbau_convergence_threshold",
+        "occupation outside the Fermi-level window allowed at convergence; "
+        "negative disables the check",
+        Tbase(1e-6)};
+
     /// Safety factor K for the arithmetic-precision clamp on the
     /// effective convergence threshold: the SCF is considered
     /// converged when the DIIS error drops below
@@ -541,6 +565,28 @@ namespace OpenOrbitalOptimizer {
         false,
         nullptr,
         &SCFSolver::converged_as_int_};
+
+    /// Occupation-space diagnostics. Like ``converged`` they carry no
+    /// stored value and re-measure the current iterate on every read,
+    /// so a caller can ask what the occupations look like at any point
+    /// rather than only at the end. See ``particle_number_error`` and
+    /// ``aufbau_error`` for what each measures and why only one of
+    /// them gates convergence.
+    Setting<Tbase> particle_number_error_{
+        settings_, "particle_number_error",
+        "largest |sum(n) - N| over the particle types -- re-measured now",
+        Tbase(0),
+        false,
+        nullptr,
+        &SCFSolver::particle_number_error_source_};
+
+    Setting<Tbase> aufbau_error_{
+        settings_, "aufbau_error",
+        "largest occupation outside the Fermi-level window -- re-measured now",
+        Tbase(0),
+        false,
+        nullptr,
+        &SCFSolver::aufbau_error_source_};
 
     /// Every setting, in declaration order. Supplied by the registry
     /// the settings added themselves to as they were constructed.
@@ -4056,6 +4102,15 @@ namespace OpenOrbitalOptimizer {
       return converged() ? 1 : 0;
     }
 
+    /// Sources for the occupation-space diagnostics; like converged,
+    /// they store nothing and re-measure the current iterate on read.
+    Tbase particle_number_error_source_() const {
+      return particle_number_error();
+    }
+    Tbase aufbau_error_source_() const {
+      return aufbau_error();
+    }
+
     /// Validator for methods: parse to check the tokens, store the
     /// canonical uppercase spelling.
     std::string canonicalise_methods_(const std::string & v) const {
@@ -4551,6 +4606,97 @@ namespace OpenOrbitalOptimizer {
                                   /*exclude_reference=*/true);
     }
 
+    /// How far the occupations are from carrying the requested number
+    /// of particles: the largest ``|sum(n) - N|`` over the particle
+    /// types.
+    ///
+    /// This is an invariant rather than a convergence measure. Every
+    /// step forms densities out of ingredients that already carry the
+    /// right particle number, so the only way to lose any is for
+    /// something to discard it, and iterating will not bring it back.
+    /// It is reported so that a run cannot quietly finish carrying a
+    /// micro-electron of error, but deliberately does not gate
+    /// ``converged()``: a solver that cannot converge is worse than
+    /// one that tells you its answer is off.
+    Tbase particle_number_error() const {
+      if(orbital_history_.empty()) return 0;
+      const auto occupations = get_orbital_occupations();
+      Tbase worst = 0;
+      for(Index iparticle = 0;
+          iparticle < number_of_blocks_per_particle_type_.size(); iparticle++) {
+        const size_t offset = particle_block_offset(iparticle);
+        Tbase sum = 0;
+        for(size_t iblock = offset;
+            iblock < offset + (size_t) number_of_blocks_per_particle_type_(iparticle);
+            iblock++)
+          sum += occupations[iblock].sum();
+        worst = std::max(worst,
+                         std::abs(sum - number_of_particles_(iparticle)));
+      }
+      return worst;
+    }
+
+    /// How far the occupations are from Aufbau: the largest occupation
+    /// sitting above the Fermi level, or missing from below it,
+    /// measured against the Aufbau filling of the current orbital
+    /// energies.
+    ///
+    /// Orbitals inside the degenerate cluster the Fermi level lands in
+    /// are exempt, since that is where fractional occupation is
+    /// legitimate; the window is the same
+    /// ``optimal_damping_degeneracy_threshold_`` the ODA skeleton walk
+    /// uses. The comparison is against the whole particle type's
+    /// energy ordering rather than each block's, because the Fermi
+    /// level is filled across blocks and its degeneracies routinely
+    /// span them.
+    ///
+    /// Unlike the particle-number error this *is* a convergence
+    /// measure: the iterate is a mixed density whose occupations are
+    /// only Aufbau once the mixing has collapsed onto the minimiser,
+    /// so this falls as the SCF converges. Returns 0 when the
+    /// occupations are not the solver's to choose.
+    Tbase aufbau_error() const {
+      if(orbital_history_.empty() || frozen_occupations_) return 0;
+
+      Orbitals<Torb> C_pseudo;
+      OrbitalEnergies<Tbase> eps;
+      const auto occupations = get_orbital_occupations();
+      pseudo_canonicalise_(get_orbitals(), get_fock_matrix(), occupations,
+                           C_pseudo, eps);
+      const auto aufbau = update_occupations(eps);
+
+      Tbase worst = 0;
+      for(Index iparticle = 0;
+          iparticle < number_of_blocks_per_particle_type_.size(); iparticle++) {
+        const auto levels = order_orbitals_by_energy(eps, iparticle);
+        // Fermi level: the highest energy that Aufbau actually fills.
+        bool have_fermi = false;
+        Tbase eps_fermi = 0;
+        for(const auto & level : levels) {
+          const size_t iblock = std::get<1>(level);
+          const size_t iorb = std::get<2>(level);
+          if(aufbau[iblock](iorb) > occupation_change_threshold_) {
+            eps_fermi = std::get<0>(level);
+            have_fermi = true;
+          }
+        }
+        if(!have_fermi) continue;
+
+        for(const auto & level : levels) {
+          const Tbase energy = std::get<0>(level);
+          const size_t iblock = std::get<1>(level);
+          const size_t iorb = std::get<2>(level);
+          if(std::abs(energy - eps_fermi) <= optimal_damping_degeneracy_threshold_)
+            continue;  // inside the Fermi-level cluster; free to be fractional
+          const Tbase n = occupations[iblock](iorb);
+          worst = std::max(worst, energy > eps_fermi
+                                    ? std::abs(n)
+                                    : std::abs(maximum_occupation_(iblock) - n));
+        }
+      }
+      return worst;
+    }
+
     /// Check if we are converged
     bool converged() const {
         // Nothing has been iterated yet, so trivially not converged.
@@ -4571,6 +4717,24 @@ namespace OpenOrbitalOptimizer {
             return norm(diis_error_vector(0))
                 <= effective_convergence_threshold_();
         }
+    }
+
+    /// Whether the occupations are Aufbau to within
+    /// ``aufbau_convergence_threshold_``. The other half of
+    /// convergence: ``converged()`` asks whether the orbitals are at a
+    /// stationary point, this asks whether the occupations are at one.
+    ///
+    /// Kept separate rather than folded into ``converged()`` because
+    /// the two are established differently. The gradient criterion is
+    /// a pure observation, but occupation space is only put right by
+    /// ``aufbau_cleanup_step``, which needs the gradient to have
+    /// converged first -- so a single predicate that demanded both
+    /// would be circular, blocking on an error that nothing had yet
+    /// been allowed to fix. ``run()`` therefore orders them: gradient,
+    /// then cleanup, then this.
+    bool occupations_converged() const {
+        if(aufbau_convergence_threshold_ < Tbase(0)) return true;
+        return aufbau_error() <= aufbau_convergence_threshold_;
     }
 
     /// Run the SCF
@@ -4657,6 +4821,9 @@ namespace OpenOrbitalOptimizer {
 
       old_energy_ = Tbase(0);
       int failed_iterations = 0;
+      // Whether the "gradient converged, occupations have not" notice
+      // has already been given at full volume this run.
+      bool occupations_blocked_reported = false;
       // Number of orbital-rotation steps still owed by the current ODA -> orbital-rotation burst,
       // budgeted by orbital_rotation_steps_after_oda_ at the ODA transition.
       size_t orbital_rotation_steps_remaining = 0;
@@ -4808,6 +4975,9 @@ namespace OpenOrbitalOptimizer {
         log_(5, "\n\n");
         log_(1, "Iteration %i: %i Fock evaluations energy % .10f change % e DIIS error vector %s norm %e\n", (int) iteration, (int) number_of_fock_evaluations_, (double) (get_energy()), (double) (dE), error_norm_.get().c_str(), (double) (diis_error));
         log_(5, "History size %i\n",(int) orbital_history_.size());
+        if(verbosity_>=5)
+          log_(5, "Occupations: particle-number error %e, Aufbau error %e\n",
+               (double) (particle_number_error()), (double) (aufbau_error()));
         if(verbosity_>=5) {
           const auto occupations = get_orbital_occupations();
           auto occ_idx(occupied_orbitals(occupations));
@@ -4852,6 +5022,28 @@ namespace OpenOrbitalOptimizer {
           // Aufbau filling of the converged Fock matrix instead, when
           // it does not cost energy.
           aufbau_cleanup_step();
+
+          // Occupation space gets its say only now, with the cleanup
+          // already applied: it is the step that puts the occupations
+          // right, so testing before it would block on an error
+          // nothing had been allowed to fix.
+          if(!occupations_converged()) {
+            // Said once at the volume of the iteration line, then
+            // demoted, so the extra iterations read as a stated
+            // reason rather than as a stall.
+            log_(occupations_blocked_reported ? 5 : 1,
+                 "Orbital gradient converged, but %e of occupation sits "
+                 "outside the Fermi-level window (threshold %e); "
+                 "continuing.\n",
+                 (double) (aufbau_error()),
+                 (double) (aufbau_convergence_threshold_.get()));
+            occupations_blocked_reported = true;
+            // Occupations are ODA's business, so hand it the next step
+            // when it is available.
+            state = pick_next({StepKind::ODA, StepKind::OrbitalRotation},
+                              StepKind::DIIS);
+            continue;
+          }
 
           log_(1, "Converged to energy % .10f!\n", (double) (get_energy()));
 

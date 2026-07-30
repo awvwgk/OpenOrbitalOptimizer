@@ -18,6 +18,39 @@
 ## v0.5.0 / (Unreleased)
 
 #### New Features
+* Convergence is now judged in occupation space as well as in the
+  orbital gradient. Two diagnostics measure it, both re-evaluated on
+  every read like ``converged``:
+    - ``particle_number_error`` -- the largest ``|sum(n) - N|`` over
+      the particle types. This is an invariant rather than a
+      convergence measure: every step mixes densities that already
+      carry the right particle number, so losing any means something
+      discarded it, and iterating will not bring it back. It is
+      therefore reported but deliberately does not gate convergence,
+      since a solver that cannot finish is worse than one that tells
+      you its answer is off.
+    - ``aufbau_error`` -- the largest occupation sitting above the
+      Fermi level or missing from below it, measured against the
+      Aufbau filling of the current orbital energies. Orbitals inside
+      the Fermi-level degenerate cluster are exempt, that being where
+      fractional occupation is legitimate. This one *is* a convergence
+      measure and bounds convergence through the new
+      ``aufbau_convergence_threshold`` setting (default 1e-6, negative
+      to switch the check off).
+    - The order matters and is why the bound is a separate predicate,
+      ``occupations_converged()``, rather than part of ``converged()``:
+      occupation space is put right by the Aufbau cleanup step, which
+      needs the gradient to have converged first. A single predicate
+      demanding both would block on an error that nothing had yet been
+      allowed to fix -- measured on iron, the Aufbau error sits at
+      5e-6 and never falls until the cleanup runs. ``run()`` therefore
+      orders them gradient, then cleanup, then occupations, and says
+      so at the volume of the iteration line if the occupations are
+      what is holding the SCF open.
+    - Costs nothing on a healthy SCF. On oxygen the Aufbau error is
+      already exactly 0 several iterations before the DIIS error
+      reaches its threshold, and iron converges in the same 431
+      iterations to the same energy with the check on or off.
 * New ``"LCIIS"`` method token implementing the least-squares
   commutator in the iterative subspace of Li & Yaron, J. Chem.
   Theory Comput. **12**, 5322 (2016),
