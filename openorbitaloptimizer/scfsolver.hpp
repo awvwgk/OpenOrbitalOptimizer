@@ -687,6 +687,14 @@ namespace OpenOrbitalOptimizer {
 
     /// Method-mix flags parsed from methods_. Shared by run() and the
     /// validator in set("methods", ...).
+    /// The ODA skeleton set: for each particle type, a list of trial
+    /// occupation vectors, one entry per block of that particle. Each
+    /// trial is an extreme integer filling of the degenerate orbital
+    /// groups at the Fock matrix it was enumerated from, and the
+    /// polytope ODA searches is their convex hull.
+    using SkeletonOccupations =
+        std::vector<std::vector<std::vector<Vector<Tbase>>>>;
+
     struct AllowedMethods {
       bool diis = false, oda = false, cg = false, lbfgs = false;
       /// LCIIS is a variant of the extrapolation step, not a step of
@@ -2302,6 +2310,19 @@ namespace OpenOrbitalOptimizer {
       return std::make_pair(lam, model_value(lam));
     }
 
+    /// One ODA step, enumerating its own skeleton set and keeping
+    /// nothing from it. This is the form the SCF state machine uses;
+    /// the Aufbau cleanup drives ``optimal_damping_step_`` directly,
+    /// because it needs to hold the skeleton set fixed across calls
+    /// and to see the best density built even when it is rejected.
+    bool optimal_damping_step(bool force_full = false) {
+      std::pair<DensityMatrix<Torb, Tbase>, FockBuilderReturn<Torb, Tbase>>
+        best_evaluated;
+      SkeletonOccupations skeletons;
+      return optimal_damping_step_(force_full, /*exclude_reference=*/false,
+                                   best_evaluated, skeletons);
+    }
+
     /// Optimal damping algorithm step. For each particle type, builds
     /// a list of skeleton density matrices corresponding to the
     /// extreme integer fillings of every degenerate orbital group at
@@ -2327,16 +2348,30 @@ namespace OpenOrbitalOptimizer {
     /// the Fermi level lands in. See ``aufbau_cleanup_step``.
     /// ``best_evaluated`` receives the lowest-energy density this step
     /// built, whether or not it beat the reference and so whether or
-    /// not the step reports success. The Aufbau cleanup needs it: the
-    /// occupations it wants are the simplex optimum, which loses to
-    /// the converged density until the orbitals have been relaxed at
-    /// them, so it would otherwise be discarded before the relaxation
-    /// that justifies it could run.
-    bool optimal_damping_step(bool force_full = false,
-                              bool exclude_reference = false,
-                              std::pair<DensityMatrix<Torb, Tbase>,
-                                        FockBuilderReturn<Torb, Tbase>>
-                                * best_evaluated = nullptr) {
+    /// not the step reports success. Only filled under
+    /// ``exclude_reference``, the Aufbau cleanup being the one caller
+    /// that needs it: the occupations it wants are the simplex
+    /// optimum, which loses to the converged density until the
+    /// orbitals have been relaxed at them, so they would otherwise be
+    /// discarded before the relaxation that justifies them could run.
+    ///
+    /// ``skeletons`` fixes the skeleton set across calls: empty on the
+    /// way in it is filled with the set this call enumerated, and
+    /// non-empty it is used in place of enumerating one. Which
+    /// orbitals form the degenerate cluster, and which integer
+    /// fillings of it to span, is a property of the solution being
+    /// refined, not of each intermediate iterate. Re-deriving it every
+    /// call makes it evaporate: relaxing the orbitals at a fixed
+    /// fractional filling pushes the cluster apart by more than
+    /// ``optimal_damping_degeneracy_threshold_``, after which the walk
+    /// no longer recognises it and hands back a simplex of dimension
+    /// zero with nothing left to optimise.
+    bool optimal_damping_step_(bool force_full,
+                               bool exclude_reference,
+                               std::pair<DensityMatrix<Torb, Tbase>,
+                                         FockBuilderReturn<Torb, Tbase>>
+                                 & best_evaluated,
+                               SkeletonOccupations & skeletons) {
       auto particles_left = [](Tbase n) {
         return n >= 10*std::numeric_limits<Tbase>::epsilon();
       };
@@ -2355,9 +2390,13 @@ namespace OpenOrbitalOptimizer {
         reference_orbitals = new_orbitals;
 
       // Skeleton occupations per particle type: [iparticle][itrial][iblock_within_particle]
-      std::vector<std::vector<std::vector<Vector<Tbase>>>> trial_occupations_per_particle(number_of_blocks_per_particle_type_.size());
+      SkeletonOccupations trial_occupations_per_particle(number_of_blocks_per_particle_type_.size());
 
-      for(Index iparticle=0; iparticle<number_of_blocks_per_particle_type_.size(); iparticle++) {
+      const bool reuse_skeletons = !skeletons.empty();
+      if(reuse_skeletons)
+        trial_occupations_per_particle = skeletons;
+
+      for(Index iparticle=0; !reuse_skeletons && iparticle<number_of_blocks_per_particle_type_.size(); iparticle++) {
         size_t iblock_start = particle_block_offset(iparticle);
         size_t nblocks_iparticle = number_of_blocks_per_particle_type_(iparticle);
 
@@ -2499,6 +2538,10 @@ namespace OpenOrbitalOptimizer {
         }
       }
 
+      // Hand the enumerated set back so later calls can hold it fixed.
+      if(!reuse_skeletons)
+        skeletons = trial_occupations_per_particle;
+
       // Skeleton-set attempts. When the full enumeration would yield
       // more skeletons than there are particle types (i.e. at least
       // one particle has a degenerate group whose integer occupation
@@ -2575,10 +2618,9 @@ namespace OpenOrbitalOptimizer {
           // for the solution like any other trial this step evaluates.
           add_entry(std::make_pair(reference_orbitals, reference_occupations),
                     reference_build);
-          if(best_evaluated)
-            *best_evaluated = std::make_pair(
-                std::make_pair(reference_orbitals, reference_occupations),
-                reference_build);
+          best_evaluated = std::make_pair(
+              std::make_pair(reference_orbitals, reference_occupations),
+              reference_build);
           log_(5, "Aufbau cleanup: lambda = 0 vertex is now a skeleton, "
                   "energy % .10f\n", (double) (reference_energy));
         }
@@ -2973,9 +3015,12 @@ namespace OpenOrbitalOptimizer {
             Vector<Tbase> x_scaled = scale * cand.lam;
             auto eval = evaluate(x_scaled);
             number_of_fock_evaluations_++;
-            if(best_evaluated
-               && eval.second.first < best_evaluated->second.first)
-              *best_evaluated = eval;
+            // Only the excluded-reference path wants this, and there
+            // best_evaluated was seeded from the promoted vertex above,
+            // so the comparison always has something to compare to.
+            if(exclude_reference
+               && eval.second.first < best_evaluated.second.first)
+              best_evaluated = eval;
             bool ok = add_entry(eval.first, eval.second);
             if(ok) {
               succ = true;
@@ -4710,19 +4755,25 @@ namespace OpenOrbitalOptimizer {
       DensityMatrix<Torb, Tbase> best_state;
       Tbase best_energy = std::numeric_limits<Tbase>::infinity();
 
-      const size_t maximum_passes = 4;
+      // The skeleton set is established once, here, from the converged
+      // Fock matrix, and then held fixed for the rest of the cleanup.
+      // It describes the solution being refined -- which orbitals are
+      // degenerate at it and which integer fillings of them to span --
+      // and re-deriving it from each relaxed iterate destroys it: the
+      // relaxation moves the cluster apart by more than the degeneracy
+      // window, the walk stops recognising it, and the simplex
+      // collapses to a point after the first pass.
+      SkeletonOccupations skeletons;
+
+      const size_t maximum_passes = 8;
       for(size_t pass = 0; pass < maximum_passes; pass++) {
-        // Choose occupations on the skeleton simplex. The search has
-        // to run at the state we are standing on, because that is what
-        // fixes the degenerate cluster the skeletons are built from --
-        // seeding it with a plain Aufbau fill instead would put the
-        // whole fractional remainder on one orbital, leave no
-        // partially filled cluster, and hand back a simplex of
-        // dimension zero with nothing to optimise.
+        // Occupations: ODA over the fixed skeleton set, the reference
+        // excluded so the result stays a combination of skeletons and
+        // therefore Aufbau.
         std::pair<DensityMatrix<Torb, Tbase>, FockBuilderReturn<Torb, Tbase>>
           best_aufbau;
-        optimal_damping_step(/*force_full=*/true, /*exclude_reference=*/true,
-                             &best_aufbau);
+        optimal_damping_step_(/*force_full=*/true, /*exclude_reference=*/true,
+                              best_aufbau, skeletons);
         if(best_aufbau.first.first.empty()) break;
 
         // Stand on it, whether or not it beat what we were standing on
