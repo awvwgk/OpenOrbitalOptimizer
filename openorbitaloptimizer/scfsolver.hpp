@@ -4776,6 +4776,14 @@ namespace OpenOrbitalOptimizer {
                               best_aufbau, skeletons);
         if(best_aufbau.first.first.empty()) break;
 
+        // The first pass has to move whatever it costs -- swapping the
+        // occupations is the point, and the relaxation that pays for
+        // it has not run yet. After that, moving somewhere worse than
+        // the best Aufbau state already found is pure loss: the
+        // relaxation only climbs back to where it was, which is how
+        // the loop used to spend its second pass.
+        if(pass > 0 && best_aufbau.second.first >= best_energy) break;
+
         // Stand on it, whether or not it beat what we were standing on
         // -- it is about to be relaxed, and it is the relaxed energy
         // that decides. This also makes the history hold nothing but
