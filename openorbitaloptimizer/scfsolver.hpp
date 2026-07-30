@@ -578,7 +578,7 @@ namespace OpenOrbitalOptimizer {
         Tbase(0),
         false,
         nullptr,
-        &SCFSolver::particle_number_error_source_};
+        &SCFSolver::particle_number_error};
 
     Setting<Tbase> aufbau_error_{
         settings_, "aufbau_error",
@@ -586,7 +586,7 @@ namespace OpenOrbitalOptimizer {
         Tbase(0),
         false,
         nullptr,
-        &SCFSolver::aufbau_error_source_};
+        &SCFSolver::aufbau_error};
 
     /// Every setting, in declaration order. Supplied by the registry
     /// the settings added themselves to as they were constructed.
@@ -4160,15 +4160,6 @@ namespace OpenOrbitalOptimizer {
       return converged() ? 1 : 0;
     }
 
-    /// Sources for the occupation-space diagnostics; like converged,
-    /// they store nothing and re-measure the current iterate on read.
-    Tbase particle_number_error_source_() const {
-      return particle_number_error();
-    }
-    Tbase aufbau_error_source_() const {
-      return aufbau_error();
-    }
-
     /// Validator for methods: parse to check the tokens, store the
     /// canonical uppercase spelling.
     std::string canonicalise_methods_(const std::string & v) const {
@@ -4684,69 +4675,6 @@ namespace OpenOrbitalOptimizer {
           break;
     }
 
-    /// Occupations interpolated along the one-parameter skeleton line
-    /// at ``lambda``: the first skeleton at 0, the second at 1.
-    /// Particles carrying a single skeleton contribute it unchanged.
-    OrbitalOccupations<Tbase> occupations_on_skeleton_line_(
-        const SkeletonOccupations & skeletons, Tbase lambda) const {
-      OrbitalOccupations<Tbase> occupations(number_of_blocks_);
-      for(size_t iparticle = 0; iparticle < skeletons.size(); iparticle++) {
-        const auto & trials = skeletons[iparticle];
-        if(trials.empty()) continue;
-        const size_t offset = particle_block_offset(iparticle);
-        for(size_t iblock = 0; iblock < trials[0].size(); iblock++)
-          occupations[offset + iblock] =
-            trials.size() >= 2
-              ? ((Tbase(1) - lambda) * trials[0][iblock]
-                 + lambda * trials[1][iblock]).eval()
-              : trials[0][iblock];
-      }
-      return occupations;
-    }
-
-    /// dE/dlambda along that line at the current iterate.
-    ///
-    /// Free of any orbital-response term, and exactly this is what
-    /// makes the relaxed model affordable. The energy depends on
-    /// lambda directly and through the orbitals it drags with it, but
-    /// at a point where the orbitals are stationary the second
-    /// contribution carries a factor dE/dkappa = 0. What is left is
-    /// Hellmann-Feynman: sum over orbitals of the occupation change
-    /// times the orbital energy. So a relaxed slope costs a
-    /// pseudo-canonicalisation and no Fock builds at all, whereas the
-    /// relaxed *curvature* would need the full response equations.
-    Tbase slope_on_skeleton_line_(const SkeletonOccupations & skeletons) const {
-      Orbitals<Torb> C_pseudo;
-      OrbitalEnergies<Tbase> eps;
-      pseudo_canonicalise_(get_orbitals(), get_fock_matrix(),
-                           get_orbital_occupations(), C_pseudo, eps);
-      Tbase slope = 0;
-      for(size_t iparticle = 0; iparticle < skeletons.size(); iparticle++) {
-        const auto & trials = skeletons[iparticle];
-        if(trials.size() < 2) continue;
-        const size_t offset = particle_block_offset(iparticle);
-        for(size_t iblock = 0; iblock < trials[0].size(); iblock++)
-          for(Index iorb = 0; iorb < trials[0][iblock].size(); iorb++)
-            slope += (trials[1][iblock](iorb) - trials[0][iblock](iorb))
-                     * eps[offset + iblock](iorb);
-      }
-      return slope;
-    }
-
-    /// Is the skeleton set a single line, i.e. one particle offering
-    /// two skeletons and every other particle exactly one? That is the
-    /// two-orbital Fermi level -- one degenerate pair sharing a
-    /// fractional occupation -- and the case the relaxed line search
-    /// below handles.
-    bool skeletons_form_a_single_line_(const SkeletonOccupations & skeletons) const {
-      size_t lines = 0;
-      for(const auto & trials : skeletons) {
-        if(trials.size() > 2) return false;
-        if(trials.size() == 2) lines++;
-      }
-      return lines == 1;
-    }
-
     /// Axis layout of the skeleton polytope once the first skeleton of
     /// each particle is promoted to the lambda = 0 vertex: one axis per
     /// skeleton after that, and ``axis[k]`` names the (particle,
@@ -4801,9 +4729,9 @@ namespace OpenOrbitalOptimizer {
 
     /// Gradient of the relaxed energy with respect to those axes, at
     /// the current iterate. The one-dimensional case of this is
-    /// ``slope_on_skeleton_line_``, and it is free for the same reason:
-    /// at an orbital-stationary point the orbital-response term carries
-    /// a factor dE/dkappa = 0 and Hellmann-Feynman is all that is left.
+    /// Free of any orbital-response term: at an orbital-stationary
+    /// point that term carries a factor dE/dkappa = 0, and
+    /// Hellmann-Feynman is all that is left.
     Vector<Tbase> relaxed_occupation_gradient_(
         const SkeletonOccupations & skeletons,
         const std::vector<std::pair<size_t, size_t>> & axis) const {
@@ -4885,126 +4813,69 @@ namespace OpenOrbitalOptimizer {
       // The Hessian is symmetric; the finite differences are not, quite.
       hessian = ((hessian + hessian.transpose()) / Tbase(2)).eval();
 
-      Vector<Tbase> lambda_star;
-      Tbase model_minimum;
-      std::tie(lambda_star, model_minimum) = solve_polytope_qp_(
-          hessian, gradient, E_origin, particle_off, particle_len);
-      log_stream_(5) << "Relaxed polytope: minimum at lambda = "
-                     << lambda_star.transpose() << std::endl;
-      if(lambda_star.template lpNorm<Eigen::Infinity>()
-           > Tbase(100) * std::numeric_limits<Tbase>::epsilon()) {
+      // Walk to the stationary point of the relaxed energy rather than
+      // stopping at the model's first guess. The model is fitted from
+      // finite differences across the whole polytope, so it locates the
+      // minimum only to a few percent, which leaves the energy a part
+      // in 1e6 high -- on a spin-restricted transition metal that is
+      // the entire gain the cleanup is trying to bank. Each step
+      // re-anchors the quadratic on the point just sampled, using the
+      // gradient there, which costs nothing beyond the relaxation
+      // already paid for.
+      Vector<Tbase> anchor = origin;
+      Vector<Tbase> anchor_gradient = gradient;
+      Tbase anchor_energy = E_origin;
+      const size_t maximum_refinements = 4;
+      for(size_t refinement = 0; refinement < maximum_refinements; refinement++) {
+        // Re-expand the model about the anchor: the QP works in
+        // absolute lambda, so fold the shift into the linear and
+        // constant terms.
+        const Vector<Tbase> g_effective = anchor_gradient - hessian * anchor;
+        const Tbase E_effective =
+            anchor_energy - anchor_gradient.dot(anchor)
+            + Tbase(1)/Tbase(2) * (anchor.transpose() * hessian * anchor).value();
+
+        Vector<Tbase> lambda_star;
+        Tbase model_minimum;
+        std::tie(lambda_star, model_minimum) = solve_polytope_qp_(
+            hessian, g_effective, E_effective, particle_off, particle_len);
+        const Vector<Tbase> step = lambda_star - anchor;
+        if(step.template lpNorm<Eigen::Infinity>()
+             <= Tbase(100) * std::numeric_limits<Tbase>::epsilon())
+          break;
+
         const Tbase E_star = sample(lambda_star);
-        log_(5, "Relaxed polytope: E at the model minimum % .10f\n",
-             (double) (E_star));
+        log_stream_(5) << "Relaxed polytope: lambda = "
+                       << lambda_star.transpose() << ", E = " << E_star
+                       << std::endl;
         if(E_star < best_energy) {
           best_energy = E_star;
           best_state = get_solution();
         }
-      }
+        // A step that does not pay is the end of the walk; the model
+        // has stopped describing the surface well enough to trust.
+        if(E_star >= anchor_energy - minimum_useful_descent_()) break;
 
-      fock_evaluations += number_of_fock_evaluations_;
-      initialize_with_orbitals(best_state.first, best_state.second);
-      return best_energy;
-    }
+        const Vector<Tbase> new_gradient =
+            relaxed_occupation_gradient_(skeletons, axis);
 
-    /// Minimise along the skeleton line with the orbitals relaxed at
-    /// every point sampled, and leave the iterate at the best point
-    /// found. Returns the energy there.
-    ///
-    /// This is the coupling the plain ODA model cannot see. That model
-    /// expands the energy in lambda at *fixed* orbitals, so its
-    /// curvature is d2E/dlambda2 with the orbitals held still, whereas
-    /// the curvature that governs where the minimum actually sits is
-    /// the relaxed one,
-    ///
-    ///     H_relaxed = H_ll - H_lk H_kk^-1 H_kl,
-    ///
-    /// smaller than the fixed-orbital H_ll by a positive semidefinite
-    /// amount, since letting the orbitals answer an occupation change
-    /// can only lower the energy. A model that is too stiff stops
-    /// short: on iron it puts the 4s/3d split at 0.826/1.174 where the
-    /// SCF finds 0.657/1.343, both on this very line.
-    ///
-    /// Rather than form that Schur complement -- which needs the
-    /// orbital response equations the solver does not have -- the
-    /// relaxation is done at the sampled points and the model is fitted
-    /// through relaxed data. Endpoint energies come from relaxing
-    /// there; endpoint slopes are free, see
-    /// ``slope_on_skeleton_line_``. Four numbers determine a cubic,
-    /// which is the same fit the ODA trial loop uses along its rays.
-    Tbase relaxed_occupation_line_search_(const AllowedMethods & allowed,
-                                          const SkeletonOccupations & skeletons,
-                                          const Orbitals<Torb> & orbitals,
-                                          int & fock_evaluations) {
-      auto sample = [&](Tbase lambda) {
-        fock_evaluations += number_of_fock_evaluations_;
-        initialize_with_orbitals(
-            orbitals, occupations_on_skeleton_line_(skeletons, lambda));
-        relax_orbitals_at_fixed_occupations_(allowed);
-        return get_energy();
-      };
+        // Correct the curvature along the step just taken. The
+        // finite-difference Hessian spans the whole polytope, so it
+        // describes the surface between its vertices rather than
+        // around the minimum, and stepping on it alone overshoots and
+        // rings. Imposing the secant condition H s = y on the
+        // direction just walked -- a symmetric rank-one update --
+        // makes the next step use the curvature actually seen there.
+        const Vector<Tbase> y = new_gradient - anchor_gradient;
+        const Vector<Tbase> residual = y - hessian * step;
+        const Tbase denominator = residual.dot(step);
+        if(std::abs(denominator)
+             > Tbase(1e-8) * step.norm() * residual.norm())
+          hessian += (residual * residual.transpose()) / denominator;
 
-      const Tbase E0 = sample(Tbase(0));
-      const Tbase slope0 = slope_on_skeleton_line_(skeletons);
-      auto best_state = get_solution();
-      Tbase best_energy = E0;
-
-      const Tbase E1 = sample(Tbase(1));
-      const Tbase slope1 = slope_on_skeleton_line_(skeletons);
-      if(E1 < best_energy) { best_energy = E1; best_state = get_solution(); }
-
-      log_(5, "Relaxed line: E(0) = % .10f slope %e, E(1) = % .10f slope %e\n",
-           (double) (E0), (double) (slope0), (double) (E1), (double) (slope1));
-
-      // Refine towards the stationary point of the relaxed energy.
-      //
-      // The cubic through the two endpoints locates it to about a
-      // percent in lambda, which leaves the energy a part in 1e6 or so
-      // above the minimum -- enough for the cleanup to be refused on a
-      // spin-restricted transition metal, where the whole gain is of
-      // that size. Refining is cheap because the slope at each new
-      // point costs nothing, so what is really wanted is a root of the
-      // slope, and opposite-signed endpoint slopes bracket one.
-      // Iterate the same cubic fit on the bracket, which is a secant
-      // step safeguarded by bisection, until the slope is small or the
-      // energy stops moving.
-      Tbase lo = 0, E_lo = E0, g_lo = slope0;
-      Tbase hi = 1, E_hi = E1, g_hi = slope1;
-      if(g_lo < 0 && g_hi > 0) {
-        const size_t maximum_refinements = 4;
-        for(size_t refinement = 0; refinement < maximum_refinements; refinement++) {
-          Tbase next = (lo + hi) / Tbase(2);
-          try {
-            auto cubic = HelperRoutines::fit_cubic_polynomial_with_derivatives<Tbase>(
-                E_lo, g_lo * (hi - lo), Tbase(1), E_hi, g_hi * (hi - lo));
-            const Tbase a2 = std::get<2>(cubic), a3 = std::get<3>(cubic);
-            auto roots = std::apply(HelperRoutines::cubic_polynomial_zeros<Tbase>, cubic);
-            for(Tbase root : {roots.first, roots.second})
-              if(root > 0 && root < 1 && 2*a2 + 6*a3*root > 0) {
-                next = lo + root * (hi - lo);
-                break;
-              }
-          } catch(const std::logic_error &) {
-            // Keep the bisection point.
-          }
-          if(!(next > lo && next < hi)) next = (lo + hi) / Tbase(2);
-
-          const Tbase E = sample(next);
-          const Tbase g = slope_on_skeleton_line_(skeletons);
-          log_(5, "Relaxed line: lambda = %e, E = % .10f, slope %e\n",
-               (double) (next), (double) (E), (double) (g));
-          if(E < best_energy) { best_energy = E; best_state = get_solution(); }
-
-          if(g < 0) { lo = next; E_lo = E; g_lo = g; }
-          else      { hi = next; E_hi = E; g_hi = g; }
-          if(std::abs(g) <= minimum_useful_descent_()) break;
-        }
-      } else {
-        // No sign change, so the minimum is an endpoint and the cubic
-        // has nothing interior to offer.
-        log_(5, "Relaxed line: endpoint slopes do not bracket a minimum "
-                "(%e, %e); keeping the better endpoint.\n",
-             (double) (slope0), (double) (slope1));
+        anchor = lambda_star;
+        anchor_gradient = new_gradient;
+        anchor_energy = E_star;
       }
 
       fock_evaluations += number_of_fock_evaluations_;
@@ -5035,9 +4906,8 @@ namespace OpenOrbitalOptimizer {
     /// occupations before any energy is compared.
     ///
     /// Where the polytope is one-dimensional the two are coupled
-    /// directly, see ``relaxed_occupation_line_search_``; up to
-    /// ``maximum_modelled_dimension`` the same is done with a
-    /// finite-difference relaxed Hessian; beyond that they alternate,
+    /// directly up to ``maximum_modelled_dimension``, see
+    /// ``relaxed_occupation_search_``; beyond that they alternate,
     /// which makes this a small SCF restricted to Aufbau-occupied
     /// densities.
     ///
@@ -5126,19 +4996,7 @@ namespace OpenOrbitalOptimizer {
       std::vector<std::pair<size_t, size_t>> axis;
       skeleton_axis_layout_(skeletons, off_unused, len_unused, axis);
 
-      if(skeletons_form_a_single_line_(skeletons)) {
-        // One degree of freedom, where the endpoint energies buy a
-        // cubic rather than the quadratic the general path fits, and
-        // the extra order is worth a branch of its own: on a
-        // transition metal the cubic locates the minimum an order of
-        // magnitude more accurately than the secant the two relaxed
-        // gradients alone would give.
-        log_(5, "Aufbau cleanup: relaxed line search over the single "
-                "occupation degree of freedom.\n");
-        relaxed_occupation_line_search_(allowed, skeletons,
-                                        diagonalized.first,
-                                        cleanup_fock_evaluations);
-      } else if(!axis.empty() && axis.size() <= maximum_modelled_dimension) {
+      if(!axis.empty() && axis.size() <= maximum_modelled_dimension) {
         log_(5, "Aufbau cleanup: relaxed search over %zu occupation "
                 "degrees of freedom.\n", axis.size());
         relaxed_occupation_search_(allowed, skeletons, diagonalized.first,
