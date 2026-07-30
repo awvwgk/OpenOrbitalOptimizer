@@ -4688,6 +4688,142 @@ namespace OpenOrbitalOptimizer {
           break;
     }
 
+    /// Occupations interpolated along the one-parameter skeleton line
+    /// at ``lambda``: the first skeleton at 0, the second at 1.
+    /// Particles carrying a single skeleton contribute it unchanged.
+    OrbitalOccupations<Tbase> occupations_on_skeleton_line_(
+        const SkeletonOccupations & skeletons, Tbase lambda) const {
+      OrbitalOccupations<Tbase> occupations(number_of_blocks_);
+      for(size_t iparticle = 0; iparticle < skeletons.size(); iparticle++) {
+        const auto & trials = skeletons[iparticle];
+        if(trials.empty()) continue;
+        const size_t offset = particle_block_offset(iparticle);
+        for(size_t iblock = 0; iblock < trials[0].size(); iblock++)
+          occupations[offset + iblock] =
+            trials.size() >= 2
+              ? ((Tbase(1) - lambda) * trials[0][iblock]
+                 + lambda * trials[1][iblock]).eval()
+              : trials[0][iblock];
+      }
+      return occupations;
+    }
+
+    /// dE/dlambda along that line at the current iterate.
+    ///
+    /// Free of any orbital-response term, and exactly this is what
+    /// makes the relaxed model affordable. The energy depends on
+    /// lambda directly and through the orbitals it drags with it, but
+    /// at a point where the orbitals are stationary the second
+    /// contribution carries a factor dE/dkappa = 0. What is left is
+    /// Hellmann-Feynman: sum over orbitals of the occupation change
+    /// times the orbital energy. So a relaxed slope costs a
+    /// pseudo-canonicalisation and no Fock builds at all, whereas the
+    /// relaxed *curvature* would need the full response equations.
+    Tbase slope_on_skeleton_line_(const SkeletonOccupations & skeletons) const {
+      Orbitals<Torb> C_pseudo;
+      OrbitalEnergies<Tbase> eps;
+      pseudo_canonicalise_(get_orbitals(), get_fock_matrix(),
+                           get_orbital_occupations(), C_pseudo, eps);
+      Tbase slope = 0;
+      for(size_t iparticle = 0; iparticle < skeletons.size(); iparticle++) {
+        const auto & trials = skeletons[iparticle];
+        if(trials.size() < 2) continue;
+        const size_t offset = particle_block_offset(iparticle);
+        for(size_t iblock = 0; iblock < trials[0].size(); iblock++)
+          for(Index iorb = 0; iorb < trials[0][iblock].size(); iorb++)
+            slope += (trials[1][iblock](iorb) - trials[0][iblock](iorb))
+                     * eps[offset + iblock](iorb);
+      }
+      return slope;
+    }
+
+    /// Is the skeleton set a single line, i.e. one particle offering
+    /// two skeletons and every other particle exactly one? That is the
+    /// two-orbital Fermi level -- one degenerate pair sharing a
+    /// fractional occupation -- and the case the relaxed line search
+    /// below handles.
+    bool skeletons_form_a_single_line_(const SkeletonOccupations & skeletons) const {
+      size_t lines = 0;
+      for(const auto & trials : skeletons) {
+        if(trials.size() > 2) return false;
+        if(trials.size() == 2) lines++;
+      }
+      return lines == 1;
+    }
+
+    /// Minimise along the skeleton line with the orbitals relaxed at
+    /// every point sampled, and leave the iterate at the best point
+    /// found. Returns the energy there.
+    ///
+    /// This is the coupling the plain ODA model cannot see. That model
+    /// expands the energy in lambda at *fixed* orbitals, so its
+    /// curvature is d2E/dlambda2 with the orbitals held still, whereas
+    /// the curvature that governs where the minimum actually sits is
+    /// the relaxed one,
+    ///
+    ///     H_relaxed = H_ll - H_lk H_kk^-1 H_kl,
+    ///
+    /// smaller than the fixed-orbital H_ll by a positive semidefinite
+    /// amount, since letting the orbitals answer an occupation change
+    /// can only lower the energy. A model that is too stiff stops
+    /// short: on iron it puts the 4s/3d split at 0.826/1.174 where the
+    /// SCF finds 0.657/1.343, both on this very line.
+    ///
+    /// Rather than form that Schur complement -- which needs the
+    /// orbital response equations the solver does not have -- the
+    /// relaxation is done at the sampled points and the model is fitted
+    /// through relaxed data. Endpoint energies come from relaxing
+    /// there; endpoint slopes are free, see
+    /// ``slope_on_skeleton_line_``. Four numbers determine a cubic,
+    /// which is the same fit the ODA trial loop uses along its rays.
+    Tbase relaxed_occupation_line_search_(const AllowedMethods & allowed,
+                                          const SkeletonOccupations & skeletons,
+                                          const Orbitals<Torb> & orbitals,
+                                          int & fock_evaluations) {
+      auto sample = [&](Tbase lambda) {
+        fock_evaluations += number_of_fock_evaluations_;
+        initialize_with_orbitals(
+            orbitals, occupations_on_skeleton_line_(skeletons, lambda));
+        relax_orbitals_at_fixed_occupations_(allowed);
+        return get_energy();
+      };
+
+      const Tbase E0 = sample(Tbase(0));
+      const Tbase slope0 = slope_on_skeleton_line_(skeletons);
+      auto best_state = get_solution();
+      Tbase best_energy = E0;
+
+      const Tbase E1 = sample(Tbase(1));
+      const Tbase slope1 = slope_on_skeleton_line_(skeletons);
+      if(E1 < best_energy) { best_energy = E1; best_state = get_solution(); }
+
+      log_(5, "Relaxed line: E(0) = % .10f slope %e, E(1) = % .10f slope %e\n",
+           (double) (E0), (double) (slope0), (double) (E1), (double) (slope1));
+
+      // Interior minimum of the cubic through the relaxed endpoints.
+      try {
+        auto cubic = HelperRoutines::fit_cubic_polynomial_with_derivatives<Tbase>(
+            E0, slope0, Tbase(1), E1, slope1);
+        const Tbase a2 = std::get<2>(cubic), a3 = std::get<3>(cubic);
+        auto roots = std::apply(HelperRoutines::cubic_polynomial_zeros<Tbase>, cubic);
+        for(Tbase root : {roots.first, roots.second}) {
+          if(!(root > 0 && root < 1)) continue;
+          if(2*a2 + 6*a3*root <= 0) continue;  // maximum, not minimum
+          const Tbase E = sample(root);
+          log_(5, "Relaxed line: interior minimum at lambda = %e, "
+                  "E = % .10f\n", (double) (root), (double) (E));
+          if(E < best_energy) { best_energy = E; best_state = get_solution(); }
+          break;
+        }
+      } catch(const std::logic_error &) {
+        // No real stationary point; the endpoints are all there is.
+      }
+
+      fock_evaluations += number_of_fock_evaluations_;
+      initialize_with_orbitals(best_state.first, best_state.second);
+      return best_energy;
+    }
+
     /// Replace the converged iterate's occupations with an Aufbau
     /// filling, relaxing the orbitals at those occupations before
     /// judging whether the swap was worth making.
@@ -4765,6 +4901,32 @@ namespace OpenOrbitalOptimizer {
       // collapses to a point after the first pass.
       SkeletonOccupations skeletons;
 
+      // Establish the skeleton set, and with it the orbitals the
+      // skeletons are indexed against.
+      auto diagonalized = compute_orbitals(get_fock_matrix());
+      {
+        std::pair<DensityMatrix<Torb, Tbase>, FockBuilderReturn<Torb, Tbase>>
+          discard;
+        SkeletonOccupations enumerated;
+        // A dry run purely to enumerate; its energy verdict is not used.
+        const auto history_before = orbital_history_;
+        optimal_damping_step_(/*force_full=*/true, /*exclude_reference=*/true,
+                              discard, enumerated);
+        orbital_history_ = history_before;
+        clear_diis_caches_();
+        skeletons = std::move(enumerated);
+      }
+
+      // Two skeletons on one line is the two-orbital Fermi level, and
+      // there the coupling between the occupations and the orbitals can
+      // be modelled directly instead of alternated around.
+      if(skeletons_form_a_single_line_(skeletons)) {
+        log_(5, "Aufbau cleanup: relaxed line search over the single "
+                "occupation degree of freedom.\n");
+        relaxed_occupation_line_search_(allowed, skeletons,
+                                        diagonalized.first,
+                                        cleanup_fock_evaluations);
+      } else {
       const size_t maximum_passes = 8;
       for(size_t pass = 0; pass < maximum_passes; pass++) {
         // Occupations: ODA over the fixed skeleton set, the reference
@@ -4803,6 +4965,8 @@ namespace OpenOrbitalOptimizer {
         if(now >= best_energy - minimum_useful_descent_()) break;
         best_energy = now;
         best_state = get_solution();
+      }
+
       }
 
       // Stand on the best pass, not the last one.
