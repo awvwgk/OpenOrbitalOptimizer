@@ -399,6 +399,31 @@
       free-slope argument holds only at a stationary point.
     - Fermi levels spanning more than two orbitals still fall back to
       the alternation and may still be rejected.
+    - The search starts at the polytope point whose occupations best
+      reproduce the ones the solver is standing on, found by least
+      squares on the same simplex the energy model is minimised over.
+      Starting at a skeleton vertex instead put the first sample 0.06
+      to 1.0 Eh above the converged density, since for a fractionally
+      occupied Fermi level the promoted vertex is a plain Aufbau fill
+      that dumps the whole remainder onto one orbital. Everything after
+      that was a climb back, and a climb that stops short reads as the
+      Aufbau state losing on energy when it has merely not arrived --
+      lanthanides and actinides recovered 69% to 98% of it and were
+      rejected by 7 to 27 mEh, while the occupations they were rejected
+      in favour of were already Aufbau to 2.2e-7, worth about 1e-6 Eh.
+    - The cleanup runs on every way out of the SCF loop, not only the
+      converged one. Missing the threshold by a few percent used to
+      cost the entire Aufbau structure: a run stalling at 1.06e-7
+      against 1e-7 kept the raw mixed density and its whole Rydberg
+      tail, some fifty orbitals down to 1e-12. It is adopted only if it
+      does not raise the energy, so it cannot make the reported answer
+      worse.
+    - Acceptance is judged against the descent the solver already calls
+      noise rather than demanding a strict improvement, which had been
+      discarding exactly-Aufbau occupations over gaps as small as
+      1.8e-11 Eh.
+    - With these, all 118 spherically averaged neutral atoms come out
+      exactly Aufbau.
 * ``atomtest`` gained ``--M 0``, which runs the spin-restricted code
   whatever the shell structure and gives an open shell a fractionally
   occupied Fermi level rather than refusing it. The ``restricted``
