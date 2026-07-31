@@ -56,6 +56,23 @@ set_tests_properties(
     COMMAND $<TARGET_FILE:openorbopt-settings-roundtrip>
   )
 
+  # Aufbau cleanup on a Fermi level degenerate across more than two
+  # orbitals, where the occupation polytope is not a line. The atomic
+  # driver cannot reach this, its blocks holding whole l shells.
+  add_executable(
+    openorbopt-degenerate-occupations
+    degenerate_occupations.cpp
+  )
+  target_link_libraries(
+    openorbopt-degenerate-occupations
+    PRIVATE
+    ${ooo}::OpenOrbitalOptimizer
+  )
+  add_test(
+    NAME openorbopt/degenerate-occupations
+    COMMAND $<TARGET_FILE:openorbopt-degenerate-occupations>
+  )
+
   # Instantiations of SCFSolver<Tbase, IsComplex> for
   # <float, false>, <float, true>, and <double, true>.
   # The <double, false> path is exercised by the atomtest target above.

@@ -294,6 +294,37 @@ int main() {
     REQUIRE(s.get_string("methods") == "DIIS + ODA + LBFGS");
   }
 
+  // Occupation-space diagnostics. This solver has one block of two
+  // orbitals holding two particles, so Aufbau fills the lower orbital
+  // and empties the upper one; a converged run has to reproduce that
+  // exactly, and to carry the two particles it was asked for.
+  {
+    auto s = make_solver();
+    FockMatrix<double> g(1);
+    g[0] = Matrix<double>::Identity(2, 2) * -1.0;
+    s.initialize_with_fock(g);
+    s.run();
+    REQUIRE(s.converged());
+    REQUIRE(s.particle_number_error() <= 1e-12);
+    REQUIRE(s.aufbau_error() <= 1e-12);
+    // Both are also readable through the facade, and re-measure rather
+    // than returning a value stored at some earlier point.
+    REQUIRE(s.get_real("particle_number_error") == s.particle_number_error());
+    REQUIRE(s.get_real("aufbau_error") == s.aufbau_error());
+  }
+
+  // A negative Aufbau threshold switches the occupation-space half of
+  // the convergence test off, leaving the gradient criterion alone.
+  {
+    auto s = make_solver();
+    FockMatrix<double> g(1);
+    g[0] = Matrix<double>::Identity(2, 2) * -1.0;
+    s.initialize_with_fock(g);
+    REQUIRE(s.get_real("aufbau_convergence_threshold") > 0.0);
+    s.set(std::string("aufbau_convergence_threshold"), -1.0);
+    REQUIRE(s.occupations_converged());
+  }
+
   // LCIIS method token. LCIIS is a variant of the extrapolation step
   // rather than a step of its own, so the token has to imply DIIS --
   // every state-machine gate gets asked "is DIIS allowed?", never

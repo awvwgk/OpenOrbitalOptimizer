@@ -79,8 +79,12 @@ namespace OpenOrbitalOptimizer {
     std::tuple<double,std::vector<Eigen::MatrixXd>> build_xc_unpolarized(const std::vector<std::shared_ptr<const RadialBasis>> & basis, const std::vector<Eigen::MatrixXd> & P, size_t N, int func_id) {
       assert(basis.size() == P.size());
 
-      // Handle case of no functional
-      if(func_id==-1) {
+      // Handle case of no functional. Libxc numbers its functionals
+      // from one, so any non-positive id means "nothing to add here":
+      // 0 as written on the command line by someone who wants, say,
+      // exchange only, and -1 as returned by
+      // ``xc_functional_get_number`` for a name it does not know.
+      if(func_id<=0) {
         std::vector<Eigen::MatrixXd> F(basis.size());
         for(size_t l=0;l<basis.size();l++)
           F[l] = Eigen::MatrixXd::Zero(basis[l]->nbf(),basis[l]->nbf());
@@ -168,8 +172,8 @@ namespace OpenOrbitalOptimizer {
       assert(basis.size() == Pa.size());
       assert(basis.size() == Pb.size());
 
-      // Handle case of no functional
-      if(func_id==-1) {
+      // Handle case of no functional; see build_xc_unpolarized.
+      if(func_id<=0) {
         std::vector<Eigen::MatrixXd> Fa(basis.size()), Fb(basis.size());
         for(size_t l=0;l<basis.size();l++) {
           Fa[l] = Eigen::MatrixXd::Zero(basis[l]->nbf(),basis[l]->nbf());
@@ -278,6 +282,18 @@ namespace OpenOrbitalOptimizer {
     std::tuple<double,std::vector<Eigen::MatrixXd>,std::vector<Eigen::MatrixXd>> build_xc_neo(const std::vector<std::shared_ptr<const RadialBasis>> & pbasis, const std::vector<Eigen::MatrixXd> & Pp, const std::vector<std::shared_ptr<const RadialBasis>> & ebasis, const std::vector<Eigen::MatrixXd> & Pe, size_t N, int func_id) {
       assert(pbasis.size() == Pp.size());
       assert(ebasis.size() == Pe.size());
+
+      // Handle case of no functional; see build_xc_unpolarized. This
+      // is the default for the electron-proton correlation, so running
+      // NEO without one has to be allowed.
+      if(func_id<=0) {
+        std::vector<Eigen::MatrixXd> Fp(pbasis.size()), Fe(ebasis.size());
+        for(size_t l=0;l<pbasis.size();l++)
+          Fp[l] = Eigen::MatrixXd::Zero(pbasis[l]->nbf(),pbasis[l]->nbf());
+        for(size_t l=0;l<ebasis.size();l++)
+          Fe[l] = Eigen::MatrixXd::Zero(ebasis[l]->nbf(),ebasis[l]->nbf());
+        return std::make_tuple(0.0,Fp,Fe);
+      }
 
       // Get radial grid
       IntegratorXX::TreutlerAhlrichs<double,double> quad(N);
@@ -1109,8 +1125,7 @@ int main(int argc, char **argv) {
   // full option name, no short option, description, argument required
   parser.add<int>("Z", 0, "nuclear charge", true);
   parser.add<int>("Q", 0, "atom's charge", false, 0);
-  parser.add<int>("M", 0, "atom's spin multiplicity", true);
-  parser.add<int>("restricted", 0, "spin restricted operation? -1 for auto", false, -1);
+  parser.add<int>("M", 0, "atom's spin multiplicity; 0 runs the spin-restricted code, which for an open shell means a fractionally occupied Fermi level", true);
   parser.add<int>("Ngrid", 0, "number of radial grid points", false, 2500);
   parser.add<int>("verbosity", 0, "level of verbosity", false, 5);
   parser.add<std::string>("xfunc", 0, "exchange functional", true);
@@ -1132,10 +1147,6 @@ int main(int argc, char **argv) {
   int Z = parser.get<int>("Z");
   int Q = parser.get<int>("Q");
   int M = parser.get<int>("M");
-  int restricted = parser.get<int>("restricted");
-  if(restricted == -1 and M == 1)
-    // Automatic spin-restriction
-    restricted=1;
 
   double linear_dependency_threshold = parser.get<double>("lindepthresh");
   double convergence_threshold = parser.get<double>("convthr");
@@ -1232,7 +1243,13 @@ int main(int argc, char **argv) {
     // electron count alone is not what the occupations sum to.
     OpenOrbitalOptimizer::AtomicSolver::unrestricted_neo_scf(Z, Q, M, x_func_id, c_func_id, epc_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, protonic_basis, proton_mass, verbosity, core_excitation, oda, oda_degeneracy_threshold, maxiter, methods_override);
   } else {
-    if(M==1) {
+    // M = 0 asks for the spin-restricted treatment whatever the shell
+    // structure: one set of orbitals, shell capacities of 2(2l+1), and
+    // the particle number taken as given. An open shell then comes out
+    // with a fractionally occupied Fermi level rather than being
+    // refused, which is what a spherically averaged atom wants and what
+    // the old, unused "restricted" flag was reaching for.
+    if(M<=1) {
       conserved = check_particle_number(
         OpenOrbitalOptimizer::AtomicSolver::restricted_scf(Z, Q, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, core_excitation, oda, oda_degeneracy_threshold, maxiter, methods_override));
     } else {
