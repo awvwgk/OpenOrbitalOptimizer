@@ -2405,7 +2405,12 @@ namespace OpenOrbitalOptimizer {
         auto all_energies = order_orbitals_by_energy(new_orbital_energies, iparticle);
 
         size_t ifill=0;
-        while(particles_left(num_left)) {
+        // Bound the walk by the orbitals available as well as by the
+        // particles left to place. A particle type with no orbitals to
+        // put its particles in cannot be filled, and without this the
+        // walk indexes past the end of an empty list rather than
+        // saying so.
+        while(particles_left(num_left) && ifill < all_energies.size()) {
           // Find end of this degenerate group
           const size_t jfill = degenerate_cluster_end_(
               ifill, all_energies.size(),
