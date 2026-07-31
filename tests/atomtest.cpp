@@ -1074,6 +1074,17 @@ std::vector<std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasi
     Z_string = Z_ostring.str();
   }
 
+  // Say so plainly when the file has nothing for this element.
+  // Indexing a missing key yields a null value, which iterates as an
+  // empty range, and an empty basis then propagates all the way into
+  // the solver as a particle type with no blocks, where it surfaces as
+  // a segmentation fault a long way from the cause.
+  if(not data.contains("elements")
+     or not data["elements"].contains(Z_string)
+     or not data["elements"][Z_string].contains("electron_shells"))
+    throw std::logic_error("Basis set " + basisfile
+                           + " has no entry for element Z=" + Z_string + "!\n");
+
   // Collect the exponents per shell
   std::vector<std::vector<std::pair<int, double>>> functions;
   for (auto & [shell_key, shell_value] : data["elements"][Z_string]["electron_shells"].items()) {
