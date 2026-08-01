@@ -1,3 +1,7 @@
+#ifdef OPENORBOPT_QUAD
+// Must precede every Eigen header; see the header's own note.
+#include <openorbitaloptimizer/quad_support.hpp>
+#endif
 #include "atomicsolver.hpp"
 #include <integratorxx/quadratures/all.hpp>
 #include <cassert>
@@ -10,6 +14,9 @@
 namespace OpenOrbitalOptimizer {
   // Instantiate all types of SCFSolver just to check it compiles
   template class SCFSolver<double, double>;
+#ifdef OPENORBOPT_QUAD
+  template class SCFSolver<_Float128, _Float128>;
+#endif
 
   namespace AtomicSolver {
 
@@ -607,6 +614,93 @@ namespace OpenOrbitalOptimizer {
       return scfsolver;
     }
 
+#ifdef OPENORBOPT_QUAD
+    // Spin-restricted SCF with the solver running in quad precision.
+    //
+    // Only the solver is promoted. The Fock builder stays in double --
+    // its integrals go through Libxc and the libm gamma functions, and
+    // neither has a quad interface -- so the density is demoted at the
+    // boundary and the Fock matrix promoted back. That is exactly the
+    // point: the two precisions bracket where a numerical effect can
+    // come from. Anything that survives here is the Fock build's, since
+    // everything the solver itself does is now exact by comparison;
+    // anything that vanishes was the solver's own arithmetic.
+    OpenOrbitalOptimizer::SCFSolver<_Float128, _Float128> restricted_scf_quad(int Z, int Q, int x_func_id, int c_func_id, int Ngrid, double linear_dependency_threshold, double convergence_threshold, const std::vector<std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasis>> & radial_basis, int verbosity, bool oda, double oda_degeneracy_threshold, int maxiter, const std::string & methods_override) {
+      using Q128 = _Float128;
+
+      std::vector<Eigen::MatrixXd> X = form_X(linear_dependency_threshold, radial_basis);
+      std::vector<std::pair<Eigen::MatrixXd, Eigen::MatrixXd>> Hcore = form_core_hamiltonian(radial_basis, Z);
+
+      OpenOrbitalOptimizer::IndexVector number_of_blocks_per_particle_type(1);
+      number_of_blocks_per_particle_type(0) = static_cast<Eigen::Index>(radial_basis.size());
+
+      OpenOrbitalOptimizer::Vector<Q128> maximum_occupation(radial_basis.size());
+      for(size_t l=0;l<radial_basis.size();l++)
+        maximum_occupation(l) = Q128(2*(2*l+1));
+
+      OpenOrbitalOptimizer::Vector<Q128> number_of_particles(1);
+      number_of_particles(0) = Q128(Z-Q);
+
+      std::vector<std::string> block_descriptions(radial_basis.size());
+      for(size_t l=0;l<radial_basis.size();l++) {
+        std::ostringstream oss;
+        oss << "l=" << l;
+        block_descriptions[l] = oss.str();
+      }
+
+      OpenOrbitalOptimizer::FockMatrix<Q128> fock_guess(radial_basis.size());
+      for(size_t i=0;i<X.size();i++) {
+        Eigen::MatrixXd g = X[i].transpose() * (Hcore[i].first+Hcore[i].second) * X[i];
+        fock_guess[i] = g.cast<Q128>();
+      }
+
+      OpenOrbitalOptimizer::FockBuilder<Q128, Q128> fock_builder =
+        [radial_basis, X, Ngrid, x_func_id, c_func_id, Hcore](const OpenOrbitalOptimizer::DensityMatrix<Q128, Q128> & dm) {
+        // Demote to double for the integrals.
+        std::vector<Eigen::MatrixXd> P(dm.first.size());
+        for(size_t l=0;l<P.size();l++) {
+          Eigen::MatrixXd C = dm.first[l].template cast<double>();
+          Eigen::VectorXd n = dm.second[l].template cast<double>();
+          P[l] = C * n.asDiagonal() * C.transpose();
+          P[l] = X[l] * P[l] * X[l].transpose();
+        }
+
+        auto coulomb = OpenOrbitalOptimizer::AtomicSolver::build_J(radial_basis, radial_basis, P);
+        auto exchange = OpenOrbitalOptimizer::AtomicSolver::build_xc_unpolarized(radial_basis, P, Ngrid, x_func_id);
+        auto correlation = OpenOrbitalOptimizer::AtomicSolver::build_xc_unpolarized(radial_basis, P, Ngrid, c_func_id);
+
+        OpenOrbitalOptimizer::FockMatrix<Q128> fock(P.size());
+        for(size_t l=0; l<fock.size(); l++) {
+          Eigen::MatrixXd f = X[l].transpose() * (Hcore[l].first + Hcore[l].second + coulomb[l] + std::get<1>(exchange)[l] + std::get<1>(correlation)[l]) * X[l];
+          fock[l] = f.cast<Q128>();
+        }
+
+        double Ekin = 0.0, Enuc = 0.0;
+        for(size_t l=0;l<P.size();l++) {
+          Ekin += (Hcore[l].first*P[l]).trace();
+          Enuc += (Hcore[l].second*P[l]).trace();
+        }
+        double Etot = Ekin + Enuc + coulomb_energy(P,coulomb)
+                    + std::get<0>(exchange) + std::get<0>(correlation);
+        return OpenOrbitalOptimizer::FockBuilderReturn<Q128, Q128>{Q128(Etot), fock};
+      };
+
+      OpenOrbitalOptimizer::SCFSolver<Q128, Q128> scfsolver(number_of_blocks_per_particle_type, maximum_occupation, number_of_particles, fock_builder, block_descriptions);
+      scfsolver.set("verbosity", verbosity);
+      scfsolver.set("convergence_threshold", Q128(convergence_threshold));
+      scfsolver.set("maximum_iterations", maxiter);
+      if(oda_degeneracy_threshold > 0)
+        scfsolver.set("optimal_damping_degeneracy_threshold", Q128(oda_degeneracy_threshold));
+      scfsolver.initialize_with_fock(fock_guess);
+      if(!methods_override.empty())
+        scfsolver.set("methods", methods_override);
+      else if(oda)
+        scfsolver.set("methods", std::string("ODA + CG"));
+      scfsolver.run();
+      return scfsolver;
+    }
+#endif
+
     OpenOrbitalOptimizer::SCFSolver<double, double> unrestricted_scf(int Z, int Q, int M, int x_func_id, int c_func_id, int Ngrid, double linear_dependency_threshold, double convergence_threshold, const std::vector<std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasis>> & radial_basis, int verbosity, bool core_excitation, bool oda, double oda_degeneracy_threshold, int maxiter, const std::string & methods_override) {
       // Form the orthogonal orbital basis
       std::vector<Eigen::MatrixXd> X = form_X(linear_dependency_threshold, radial_basis);
@@ -1150,6 +1244,7 @@ int main(int argc, char **argv) {
   parser.add<double>("convthr", 0, "Convergence threshold", false, 1e-6);
   parser.add<double>("protonmass", 0, "Mass of proton in atomic units (m_p/m_e)", false, 1836.15267389); // CODATA 2014 value
   parser.add<int>("maxiter", 0, "maximum number of iterations to do", false, 1000);
+  parser.add<bool>("quad", 0, "run the solver in quad precision (the Fock build stays double)", false, false);
   parser.add<bool>("oda", 0, "Use optimal damping for SCF?", false, false);
   parser.add<std::string>("methods", 0, "SCF method mix (e.g. \"LCIIS + ODA + CG\"); empty = driver default", false, "");
   parser.add<double>("odadegthresh", 0, "Energy gap below which orbitals are treated as degenerate in optimal damping (0 = use solver default)", false, 0.0);
@@ -1168,6 +1263,7 @@ int main(int argc, char **argv) {
   bool slater = parser.get<bool>("sto");
   bool core_excitation = parser.get<bool>("excitecore");
   int maxiter = parser.get<int>("maxiter");
+  bool quad = parser.get<bool>("quad");
   bool oda = parser.get<bool>("oda");
   std::string methods_override = parser.get<std::string>("methods");
   double oda_degeneracy_threshold = parser.get<double>("odadegthresh");
@@ -1260,7 +1356,23 @@ int main(int argc, char **argv) {
     // with a fractionally occupied Fermi level rather than being
     // refused, which is what a spherically averaged atom wants and what
     // the old, unused "restricted" flag was reaching for.
-    if(M<=1) {
+    if(quad) {
+#ifdef OPENORBOPT_QUAD
+      if(M > 1)
+        throw std::logic_error("Quad precision is only wired up for the spin-restricted driver.\n");
+      auto s = OpenOrbitalOptimizer::AtomicSolver::restricted_scf_quad(Z, Q, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, oda, oda_degeneracy_threshold, maxiter, methods_override);
+      // Report the same conservation check, in double.
+      auto occupations = s.get_orbital_occupations();
+      double total = 0.0;
+      for(size_t iblock = 0; iblock < occupations.size(); iblock++)
+        for(int k = 0; k < occupations[iblock].size(); k++)
+          total += (double) occupations[iblock](k);
+      printf("Total occupation % .12f, requested % .12f, difference %e\n",
+             total, (double) (Z-Q), total - (double) (Z-Q));
+#else
+      throw std::logic_error("This build has no _Float128 support; --quad is unavailable.\n");
+#endif
+    } else if(M<=1) {
       conserved = check_particle_number(
         OpenOrbitalOptimizer::AtomicSolver::restricted_scf(Z, Q, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, core_excitation, oda, oda_degeneracy_threshold, maxiter, methods_override));
     } else {

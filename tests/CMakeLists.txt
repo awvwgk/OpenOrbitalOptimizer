@@ -157,11 +157,22 @@ set_tests_properties(
   unset(CMAKE_REQUIRED_FLAGS)
 
   if (OPENORBOPT_HAS_FLOAT128)
+    # Give the atom driver a quad-precision path too. The solver runs in
+    # _Float128 while the Fock build stays double, which brackets where a
+    # numerical effect originates -- see restricted_scf_quad. Needs C++23
+    # for the libstdc++ _Float128 math overloads, so it is only switched
+    # on where those exist.
+    target_compile_features(openorbopt-atomtest PRIVATE cxx_std_23)
+    target_compile_definitions(openorbopt-atomtest PRIVATE OPENORBOPT_QUAD)
+
     # libquadmath is GCC's runtime for __float128/_Float128 math intrinsics.
     # libstdc++'s std::sqrt/exp/log/... for _Float128 emit calls into it on
     # some toolchains and link directly into the program on others. Link it
     # when available; harmless if all the math has been inlined.
     find_library(QUADMATH_LIBRARY NAMES quadmath)
+    if (QUADMATH_LIBRARY)
+      target_link_libraries(openorbopt-atomtest PRIVATE ${QUADMATH_LIBRARY})
+    endif()
 
     add_executable(
       openorbopt-instantiation-quad-real
