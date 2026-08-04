@@ -1,4 +1,5 @@
 install*/
 objdir*/
 paper_data/
-docs/
+docs/OOOApi/*
+!docs/OOOApi/index.md
