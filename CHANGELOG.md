@@ -26,6 +26,50 @@
     - This is test-driver work; the library does not have the
       integrals.
 
+#### Enhancements (continued)
+* The Aufbau cleanup's relaxed occupation Hessian is estimated from
+  perturbation theory rather than built by relaxing the orbitals at
+  each polytope vertex. New setting
+  ``perturbative_occupation_hessian`` (default 1; 0 restores the
+  relaxations).
+    - ``relaxed_occupation_search_`` needs the curvature of the energy
+      *after* the orbitals have re-relaxed, and obtained it by
+      performing that relaxation at every vertex -- tens of Fock
+      builds each. The second-order estimate costs one build per
+      point: a quadratic model along the rotations is minimised at
+      ``d = -(H + sigma)^-1 g``, lowering the energy by
+      ``-1/2 g^T (H + sigma)^-1 g``. With the Roothaan-Hall diagonal
+      for ``H`` that is the familiar expression -- semicanonicalise,
+      then sum the squared off-diagonal Fock elements over their
+      orbital-energy denominators; the ARH curvature model is used in
+      its place where the history has something to say.
+    - It goes through energies rather than gradients, by second
+      differences over the polytope axes.
+      ``relaxed_occupation_gradient_`` reads the orbital energies of
+      whatever iterate the solver stands on, so at an unrelaxed point
+      it returns the *bare* occupation Hessian rather than the relaxed
+      one, and the two differ by exactly the orbital response the
+      search exists to account for. The energy correction carries that
+      response; the gradient at an unrelaxed point does not.
+    - The level shift is kept in the denominator, damping the estimate
+      toward zero on the near-degenerate pairs where second-order
+      perturbation theory is least reliable. That is the conservative
+      direction: understating the gain costs a relaxation that would
+      have paid, overstating it sends the search to a point that does
+      not exist.
+    - Only the Hessian is estimated. Candidate steps are still
+      accepted on a measured relaxed energy, so the rule that a step
+      is adopted only if it demonstrably lowers the energy is
+      untouched.
+    - Measured on iron at M = 5 with ``"ODA + ARH"`` in the AHGBS-9
+      basis, spin-restricted so that the 4s and 3d shells share
+      electrons fractionally: the cleanup takes 95 Fock builds against
+      176, to the same energy to eleven digits, with the refinement
+      walk needing no relaxations at all against four. On cc-pVDZ,
+      where the cleanup is trivial, it changes nothing -- oxygen at
+      M = 1 and M = 3 and iron at M = 5 are identical with it on and
+      off.
+
 #### Bug Fixes
 
 #### Misc.
@@ -106,6 +150,161 @@
 * ``atomtest`` gained a ``--methods`` flag that overrides the
   driver's default method mix, so any token combination can be
   exercised from the command line.
+* New ``"ARH"`` method token implementing the augmented Roothaan-Hall
+  step of Høst, Olsen, Jansík, Thøgersen, Jørgensen and Helgaker,
+  J. Chem. Phys. **128**, 124106 (2008),
+  doi:[10.1063/1.2884588](https://doi.org/10.1063/1.2884588),
+  generalised to several particle types following Feldmann, Baiardi
+  and Reiher, J. Chem. Theory Comput. **19**, 856 (2023),
+  doi:[10.1021/acs.jctc.2c01035](https://doi.org/10.1021/acs.jctc.2c01035).
+  ARH is a third way of taking the orbital-rotation step, alongside
+  ``"CG"`` and ``"LBFGS"``, and like them exactly one may be
+  requested.
+    - The Hessian model is exact on the directions the density
+      history spans and equal to the Roothaan-Hall diagonal on the
+      orthogonal complement. That split is the point: the RH diagonal
+      is accurate *except* between near-degenerate orbitals, and the
+      density-difference history spans primarily those directions, so
+      the subspace made exact is the subspace where the diagonal is
+      worst.
+    - The curvature comes from the quasi-Newton condition
+      ``H (D_i - D_0) = 2 (F_i - F_0)``, read off matrices the
+      history already holds: no additional Fock builds, and a
+      rejected trial step still leaves its pair behind as free
+      curvature. Exact for Hartree-Fock, where ``F`` is linear in
+      ``D``; approximate for Kohn-Sham, with the line search
+      absorbing the difference.
+    - The two pieces of the Hessian add rather than replace. The
+      energy Hessian in the rotation parameters is
+      ``tr(dD/dx_a . dF/dD . dD/dx_b) + tr(F . d2D/dx_a dx_b)``, and
+      the quasi-Newton condition measures only the first: a Fock
+      difference reports how the density-space gradient responded and
+      says nothing about the curvature of the parametrisation itself.
+      The second piece is the Roothaan-Hall diagonal, exactly -- along
+      one rotation a one-electron energy is
+      ``const + (n_j - n_i)(eps_i - eps_j) sin^2 x``.
+    - Solved by the Woodbury identity: one diagonal division, two
+      ``n_par x 2k`` products and a ``2k x 2k`` solve, with no Krylov
+      loop and nothing of the size of a Fock build. With an empty
+      subspace it reduces exactly to the existing preconditioned
+      steepest-descent direction, so it is a refinement of that step
+      rather than a replacement for it.
+    - The subspace is joint over particle types and symmetry blocks
+      rather than one per particle. The Fock matrix of one particle
+      type responds linearly to the density of every other, so the
+      curvature coupling them exists only in the joint space -- one
+      subspace, one level shift, one line search.
+    - Carries no state between calls, the curvature being rebuilt from
+      the orbital history each step. A history entry another method
+      contributed counts as much as one the rotation step made, and
+      nothing needs invalidating when an ODA or extrapolation step
+      relocates the iterate.
+    - Entries taken at different occupations count too, which on the
+      ODA path is most of them. The curvature pairs carry occupation
+      coordinates alongside the rotation ones: writing
+      ``D = C n C^dag``, an occupation change is diagonal in the
+      reference MO basis and a rotation is off-diagonal, so the two
+      read off disjoint parts of the very same matrices -- the
+      displacement is the diagonal of the density difference and the
+      paired gradient change the diagonal of the Fock difference, the
+      derivative of the energy with respect to an occupation being
+      that orbital's energy (Janak), which is what the ODA occupation
+      gradient already uses. Nothing new is computed.
+    - Those coordinates are what make a pair *consistent* when the
+      occupations moved. A Fock difference responds to the whole move,
+      so pairing it with a displacement that described only the
+      rotation would charge occupation-driven curvature to rotation
+      directions. The check on the relative normalisation is that the
+      extended inner product reproduces the density-space one,
+      ``s . y = tr(dD dF)``, with off-diagonal pairs counted twice and
+      the diagonal once -- which is where the factor of 2 on the
+      rotation coordinates comes from. The test verifies this to
+      round-off.
+    - The step itself is still taken in the rotation coordinates
+      alone: the model is orthonormalised and the secant imposed in
+      the extended space, then restricted to the rotation rows of
+      ``Q`` and ``W``, leaving ``B`` -- built from the full inner
+      products, and so carrying what the occupation coordinates
+      contributed -- alone. Occupations remain ODA's to move.
+    - What this recovers is large. On iron at M = 5 with
+      ``"ODA + ARH"``, the calls that found no usable curvature at all
+      fall from 29 to 7, and the typical subspace goes from two
+      directions to the full nine the history holds.
+    - The occupation and rotation coordinates are measured in one
+      Euclidean metric when the directions are orthonormalised, so
+      their relative scale decides which combinations of history
+      entries form the basis the model is fitted in. This is not a
+      free choice: sweeping a fixed weight over four decades moves
+      oxygen's Fock count by up to a factor of two, and the best fixed
+      value is system-dependent -- 0.1 is the best constant on oxygen
+      and among the worst on iron (317 Fock builds against 241 at 1).
+    - So the scale is fitted per call from the curvature the pairs
+      themselves report. For a block of coordinates,
+      ``c = sum_i s_i . y_i / sum_i |s_i|^2`` is its average curvature
+      in energy per squared displacement, and scaling the occupation
+      coordinates by ``sqrt(c_occupation / c_rotation)`` leaves both
+      blocks at the same average curvature, so the singular values
+      being compared measure the same thing. It is a change of
+      coordinates rather than a reweighting -- displacement multiplied,
+      paired gradient change divided -- so ``s . y = tr(dD dF)`` and
+      the rotation-rotation block the step is taken in are both
+      untouched. It falls back to leaving the coordinates alone when
+      either block reports non-positive curvature.
+    - Measured against the best fixed weight, on ``"ODA + ARH"``:
+      iron 202 Fock builds against 241, chromium at M = 7 45 against
+      48, krypton 30 against 33, oxygen 24 against 21 at M = 1 and 26
+      against 23 at M = 3. It wins on the three hard cases, by 39
+      builds on iron, and costs three on each oxygen. The setting
+      ``arh_occupation_scale`` pins the weight to a positive value
+      instead, which is what the sweep used.
+    - The displacement and the gradient change are weighted by the
+      occupation differences of the *entry*, not of the reference.
+      Writing ``U = C_0^dag C_i = exp(kappa)``, the density difference
+      in the reference MO basis is ``(U n_i U^dag)_ij ~ kappa_ij
+      (n_i,j - n_i,i)`` off the diagonal, and in the reference chart
+      the derivative at the displaced point is
+      ``tr(F_i . C_0 [T_a, n_i] C_0^dag)``: both carry the entry's
+      occupations. Using the reference's instead scales every rotation
+      coordinate by the ratio of the two, an error that does not
+      vanish as the step shrinks -- measured at 90%, flat in the step
+      length, against an error linear in it for the entry's. The two
+      agree whenever the occupations do, which is why this only
+      matters once entries taken at different occupations are
+      admitted.
+    - Note that ``s . y = tr(dD dF)`` consequently holds only at fixed
+      occupations. It is a pairing in density space; the quasi-Newton
+      condition needs the one in the chart the model works in, and the
+      two coincide exactly while the map between them is the identity.
+      The test checks the identity at fixed occupations and the
+      displacement against a known ``kappa`` when they move.
+    - Two new settings: ``arh_subspace_threshold`` (default 1e-6), the
+      relative singular-value cutoff below which a history direction
+      is dropped, and ``arh_occupation_scale`` (default 0, meaning
+      fitted as above).
+    - ``atomtest`` gained a ``--set key=value[,key=value]`` flag that
+      applies arbitrary solver settings, dispatching on the type the
+      solver's own catalog reports. Unknown keys throw, so a typo in a
+      benchmark sweep fails loudly rather than silently measuring the
+      default.
+    - Measured on the DIIS-free path, where the rotation step does the
+      optimising rather than assisting an extrapolation. Oxygen with
+      PBE/cc-pVDZ converges in 21 Fock builds against 27 for both CG
+      and L-BFGS at M = 1, and 23 against 50 and 61 at M = 3. Iron at
+      M = 5, the case the occupation coordinates were built for, takes
+      241 against 564 for both -- a factor of 2.3, and 315 with the
+      rotation-only pairs, so a quarter of that gain is the occupation
+      coordinates alone. Within the DIIS mixes the counts are equal or
+      a few lower, the extrapolation having already done most of the
+      work.
+    - Krypton is the interesting case: ``"ODA + LBFGS"`` reaches the
+      converged energy there but never satisfies the gradient
+      criterion, its line search stalling with the DIIS error at
+      3.0e-6 because every trial raises the energy by around 1e-10 --
+      the energy signal has gone below the arithmetic noise while the
+      gradient is still above threshold. ``"ODA + ARH"`` converges in
+      31 Fock builds, taking the error from 4.0e-6 to 2.9e-7 on a step
+      worth 1e-10 in energy. Curvature is what is left to steer by
+      once the energy differences are noise.
 
 #### Breaking Changes
 * The default method mix is now ``"DIIS + ODA + LBFGS"`` rather than

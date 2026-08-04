@@ -73,6 +73,23 @@ set_tests_properties(
     COMMAND $<TARGET_FILE:openorbopt-degenerate-occupations>
   )
 
+  # Conventions of the ARH curvature pairs, checked against
+  # numerically differentiated gradients on a model whose two particle
+  # types are coupled.
+  add_executable(
+    openorbopt-arh-hessian
+    arh_hessian.cpp
+  )
+  target_link_libraries(
+    openorbopt-arh-hessian
+    PRIVATE
+    ${ooo}::OpenOrbitalOptimizer
+  )
+  add_test(
+    NAME openorbopt/arh-hessian
+    COMMAND $<TARGET_FILE:openorbopt-arh-hessian>
+  )
+
   # Instantiations of SCFSolver<Tbase, IsComplex> for
   # <float, false>, <float, true>, and <double, true>.
   # The <double, false> path is exercised by the atomtest target above.

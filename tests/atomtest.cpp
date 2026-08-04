@@ -11,6 +11,51 @@
 #include <nlohmann/json.hpp>
 #include "cmdline.h"
 
+
+namespace {
+  /// Extra solver settings requested on the command line as
+  /// ``--set key=value,key=value``. Held in a global rather than
+  /// threaded through every driver signature: this is a test driver,
+  /// and the alternative is the same parameter on six functions.
+  std::string g_settings_override;
+
+  /// Apply those settings, dispatching on the type the solver's own
+  /// catalog reports for each key. Unknown keys and malformed pairs
+  /// throw, so a typo in a benchmark sweep fails loudly instead of
+  /// silently measuring the default.
+  template<typename Solver>
+  void apply_settings_override(Solver & solver) {
+    if(g_settings_override.empty()) return;
+    std::string spec = g_settings_override;
+    size_t pos = 0;
+    while(pos <= spec.size()) {
+      size_t comma = spec.find(',', pos);
+      if(comma == std::string::npos) comma = spec.size();
+      std::string item = spec.substr(pos, comma - pos);
+      pos = comma + 1;
+      if(item.empty()) continue;
+      size_t eq = item.find('=');
+      if(eq == std::string::npos)
+        throw std::runtime_error("--set expects key=value, got '" + item + "'");
+      std::string key = item.substr(0, eq);
+      std::string value = item.substr(eq + 1);
+      const char * type = nullptr;
+      for(const auto & option : Solver::options())
+        if(key == option.key) { type = option.type; break; }
+      if(!type)
+        throw std::runtime_error("--set: unknown setting '" + key + "'");
+      if(std::string(type) == "real")
+        solver.set(key, (typename std::decay<decltype(solver.get_real(key))>::type)
+                          std::stod(value));
+      else if(std::string(type) == "int")
+        solver.set(key, std::stoi(value));
+      else
+        solver.set(key, value);
+      std::printf("Setting override: %s = %s\n", key.c_str(), value.c_str());
+    }
+  }
+}
+
 namespace OpenOrbitalOptimizer {
   // Instantiate all types of SCFSolver just to check it compiles
   template class SCFSolver<double, double>;
@@ -589,6 +634,7 @@ namespace OpenOrbitalOptimizer {
         scfsolver.set("methods", methods_override);
       else if(oda)
         scfsolver.set("methods", std::string("ODA + CG"));
+      apply_settings_override(scfsolver);
       scfsolver.run();
 
       if(core_excitation) {
@@ -606,7 +652,8 @@ namespace OpenOrbitalOptimizer {
           scfsolver.set("methods", methods_override);
         else if(oda)
           scfsolver.set("methods", std::string("ODA + CG"));
-        scfsolver.run();
+        apply_settings_override(scfsolver);
+      scfsolver.run();
         auto core_hole_fock_build = scfsolver.get_fock_build();
         printf("1s double ionization energy % .3f eV\n",(core_hole_fock_build.first-fock_build.first)*27.2114);
       }
@@ -696,6 +743,7 @@ namespace OpenOrbitalOptimizer {
         scfsolver.set("methods", methods_override);
       else if(oda)
         scfsolver.set("methods", std::string("ODA + CG"));
+      apply_settings_override(scfsolver);
       scfsolver.run();
       return scfsolver;
     }
@@ -838,6 +886,7 @@ namespace OpenOrbitalOptimizer {
         scfsolver.set("methods", methods_override);
       else if(oda)
         scfsolver.set("methods", std::string("ODA + CG"));
+      apply_settings_override(scfsolver);
       scfsolver.run();
 
       if(core_excitation) {
@@ -855,7 +904,8 @@ namespace OpenOrbitalOptimizer {
           scfsolver.set("methods", methods_override);
         else if(oda)
           scfsolver.set("methods", std::string("ODA + CG"));
-        scfsolver.run();
+        apply_settings_override(scfsolver);
+      scfsolver.run();
         auto core_hole_fock_build = scfsolver.get_fock_build();
         printf("1s ionization energy % .3f eV\n",(core_hole_fock_build.first-fock_build.first)*27.2114);
       }
@@ -1056,6 +1106,7 @@ namespace OpenOrbitalOptimizer {
         scfsolver.set("methods", methods_override);
       else if(oda)
         scfsolver.set("methods", std::string("ODA + CG"));
+      apply_settings_override(scfsolver);
       scfsolver.run();
 
       if(core_excitation) {
@@ -1073,7 +1124,8 @@ namespace OpenOrbitalOptimizer {
           scfsolver.set("methods", methods_override);
         else if(oda)
           scfsolver.set("methods", std::string("ODA + CG"));
-        scfsolver.run();
+        apply_settings_override(scfsolver);
+      scfsolver.run();
         auto core_hole_fock_build = scfsolver.get_fock_build();
         printf("1s ionization energy % .3f eV\n",(core_hole_fock_build.first-fock_build.first)*27.2114);
       }
@@ -1247,6 +1299,7 @@ int main(int argc, char **argv) {
   parser.add<bool>("quad", 0, "run the solver in quad precision (the Fock build stays double)", false, false);
   parser.add<bool>("oda", 0, "Use optimal damping for SCF?", false, false);
   parser.add<std::string>("methods", 0, "SCF method mix (e.g. \"LCIIS + ODA + CG\"); empty = driver default", false, "");
+  parser.add<std::string>("set", 0, "extra solver settings as key=value[,key=value]", false, "");
   parser.add<double>("odadegthresh", 0, "Energy gap below which orbitals are treated as degenerate in optimal damping (0 = use solver default)", false, 0.0);
   parser.parse_check(argc, argv);
 
@@ -1266,6 +1319,7 @@ int main(int argc, char **argv) {
   bool quad = parser.get<bool>("quad");
   bool oda = parser.get<bool>("oda");
   std::string methods_override = parser.get<std::string>("methods");
+  g_settings_override = parser.get<std::string>("set");
   double oda_degeneracy_threshold = parser.get<double>("odadegthresh");
   std::string basisfile = parser.get<std::string>("basis");
   std::string pbasisfile = parser.get<std::string>("pbasis");
