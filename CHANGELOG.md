@@ -226,6 +226,34 @@
 * ``atomtest`` gained a ``--methods`` flag that overrides the
   driver's default method mix, so any token combination can be
   exercised from the command line.
+* ``atomtest`` can now fail. It gained ``--reference-energy`` with
+  ``--energy-tolerance``, ``--max-fermi-level-error``, and a check
+  that the SCF converged at all; any of them failing exits non-zero.
+  Until now the regression tests asserted only that the driver did
+  not crash, so a run could converge to the wrong answer, or not
+  converge, and still be recorded as a pass. The two oxygen tests
+  now carry reference energies.
+* Two transition-metal regression tests, iron at M = 5 and at M = 0,
+  the latter spin-restricted so that the valence is shared
+  fractionally between the 4s and 3d shells. They run without DIIS,
+  the extrapolation otherwise converging these cases on its own and
+  leaving the orbital-rotation step barely exercised, and take three
+  to five minutes each.
+    - They are only assertable now. Before the occupations were held
+      to their stationarity conditions the same command reproducibly
+      gave two answers 2e-6 Eh apart, both reporting convergence, so
+      there was no stable energy to compare against.
+    - Each bounds the occupation stationarity residual as well as the
+      energy, which is the check that matters here: the two answers
+      the M = 5 case used to give differ by 2e-6 Eh, so an energy
+      tolerance loose enough to be robust would have accepted either.
+      The residuals differed by a factor of two and say plainly which
+      one is converged.
+    - The bounds are what the cases reach rather than round numbers.
+      M = 5 settles at a residual of 2e-7 to 8e-7 and is held to
+      1e-5; M = 0 stalls at 3e-6, an occupation there sitting against
+      a bound where the equality condition no longer applies, and is
+      held to 1e-4.
 * New ``"ARH"`` method token implementing the augmented Roothaan-Hall
   step of Høst, Olsen, Jansík, Thøgersen, Jørgensen and Helgaker,
   J. Chem. Phys. **128**, 124106 (2008),
