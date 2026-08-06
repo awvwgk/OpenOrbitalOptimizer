@@ -524,6 +524,44 @@ namespace OpenOrbitalOptimizer {
         "relaxed occupation Hessian from perturbation theory (0 = relax)",
         1};
 
+    /// Sweeps of the KKT occupation refinement to attempt after the
+    /// Aufbau cleanup. Zero switches it off.
+    Setting<int> kkt_occupation_refinement_steps_{
+        settings_, "kkt_occupation_refinement_steps",
+        "sweeps of KKT occupation refinement after the cleanup (0 = off)",
+        12};
+
+    /// Residual below which the occupations are taken to satisfy the
+    /// stationarity conditions. In energy units, those residuals being
+    /// orbital-energy differences.
+    Setting<Tbase> kkt_occupation_threshold_{
+        settings_, "kkt_occupation_threshold",
+        "orbital-energy residual accepted as occupation stationarity",
+        Tbase(1e-7)};
+
+    /// Occupation displacement used to probe the curvature by second
+    /// differences. Large enough that the differences clear round-off
+    /// in the energy, small enough to stay in the quadratic region.
+    Setting<Tbase> kkt_occupation_probe_{
+        settings_, "kkt_occupation_probe",
+        "occupation step used to probe the curvature by finite differences",
+        Tbase(1e-3)};
+
+    /// Largest occupation change a single refinement step may make.
+    ///
+    /// The curvature it divides by is a second difference of energies
+    /// that differ in the ninth decimal, so it is noisy, and a raw
+    /// Newton step on a curvature that comes out too small is enormous
+    /// -- measured, one such step moved 0.1 electrons, raised the
+    /// energy by 4e-3 Eh and the residual by a factor of 140. The
+    /// trust radius bounds the damage without needing the curvature to
+    /// be right; it is halved after a rejected step and the sweep
+    /// retried.
+    Setting<Tbase> kkt_occupation_trust_radius_{
+        settings_, "kkt_occupation_trust_radius",
+        "largest occupation change a KKT refinement step may make",
+        Tbase(5e-3)};
+
     Setting<Tbase> arh_occupation_scale_{
         settings_, "arh_occupation_scale",
         "ARH occupation-coordinate weight (<= 0 fits it from the history)",
@@ -637,6 +675,15 @@ namespace OpenOrbitalOptimizer {
         false,
         nullptr,
         &SCFSolver::aufbau_error};
+
+    Setting<Tbase> fermi_level_error_{
+        settings_, "fermi_level_error",
+        "spread of orbital energies over the fractionally occupied"
+        " orbitals -- re-measured now",
+        Tbase(0),
+        false,
+        nullptr,
+        &SCFSolver::fermi_level_error};
 
     /// Every setting, in declaration order. Supplied by the registry
     /// the settings added themselves to as they were constructed.
@@ -5827,6 +5874,7 @@ namespace OpenOrbitalOptimizer {
                 "degrees of freedom.\n", axis.size());
         relaxed_occupation_search_(allowed, skeletons, diagonalized.first,
                                    cleanup_fock_evaluations);
+
       } else {
         if(!axis.empty())
           log_(5, "Aufbau cleanup: %zu occupation degrees of freedom is "
@@ -5874,6 +5922,18 @@ namespace OpenOrbitalOptimizer {
       }
 
       // Stand on the best pass, not the last one.
+      // Both routes above settle which orbitals are occupied and
+      // relax there, walking on energy decreases and stopping when the
+      // next one falls below the threshold that keeps an already
+      // converged SCF from churning at the arithmetic floor. That
+      // threshold is on the *energy*, which near a stationary point is
+      // quadratic in the occupation displacement, so it cannot resolve
+      // where inside a fractionally occupied cluster the occupations
+      // belong. The conditions fermi_level_error measures are linear
+      // in that displacement and settle it directly -- the same job as
+      // this routine's, finished with the instrument that can see it.
+      kkt_occupation_refinement_(allowed);
+
       if(!best_state.first.empty()
          && get_energy() > best_energy + minimum_useful_descent_()) {
         cleanup_fock_evaluations += number_of_fock_evaluations_;
@@ -5970,6 +6030,360 @@ namespace OpenOrbitalOptimizer {
     /// only Aufbau once the mixing has collapsed onto the minimiser,
     /// so this falls as the SCF converges. Returns 0 when the
     /// occupations are not the solver's to choose.
+    /// Drive the occupations onto the conditions fermi_level_error
+    /// measures, by Newton on the residual rather than by minimising
+    /// the energy.
+    ///
+    /// The distinction is the whole point. Every occupation move the
+    /// solver otherwise makes is accepted on an energy decrease, and
+    /// near a stationary point the energy is quadratic in the
+    /// displacement while the residual is linear -- so an energy test
+    /// cannot resolve displacements this one settles directly. On a
+    /// spin-restricted iron atom the optimal-damping step stopped with
+    /// a predicted gain of 9.9e-8, just under the 1e-7 below which it
+    /// refuses to churn, leaving 2e-6 Eh and 0.005 electrons on the
+    /// table with every other diagnostic reporting convergence.
+    ///
+    /// The unknowns are the fractionally occupied occupations and the
+    /// chemical potential. Transfers between them conserve particle
+    /// number by construction, so the step is expressed in the
+    /// differences d_m = e_{k_m} - e_{k_0}: the gradient along one is
+    /// eps_{k_m} - eps_{k_0}, free, and the curvature comes from
+    /// second differences of the perturbatively relaxed energy, one
+    /// Fock build per point rather than one orbital optimisation.
+    ///
+    /// Orbitals pinned full or empty enter through an active set. A
+    /// pinned orbital on the wrong side of the chemical potential has
+    /// a descent direction into the fractional region, so it joins the
+    /// set and the step is re-solved; one that stays on its own side
+    /// is at a legitimate bound and is left alone.
+    ///
+    /// The step is chosen by the residual and only *checked* against
+    /// the energy: a step that raises it is rejected, so the rule that
+    /// nothing is adopted unless it lowers the energy survives.
+    bool kkt_occupation_refinement_(const AllowedMethods & allowed) {
+      if(orbital_history_.empty() || frozen_occupations_) {
+        log_(5, "KKT refinement: skipped (history empty or occupations"
+                " frozen).\n");
+        return false;
+      }
+      if(kkt_occupation_refinement_steps_ <= 0) return false;
+
+      bool improved = false;
+      Tbase trust = kkt_occupation_trust_radius_;
+      for(int sweep = 0; sweep < kkt_occupation_refinement_steps_; sweep++) {
+        const Tbase residual_before = fermi_level_error();
+        log_(5, "KKT refinement: sweep %i, residual %e.\n", sweep,
+             (double) residual_before);
+        if(residual_before <= kkt_occupation_threshold_) break;
+
+        Orbitals<Torb> C_pseudo;
+        OrbitalEnergies<Tbase> eps;
+        auto occupations = get_orbital_occupations();
+        pseudo_canonicalise_(get_orbitals(), get_fock_matrix(), occupations,
+                             C_pseudo, eps);
+        const Tbase E_before = get_energy();
+        const auto state_before = get_solution();
+
+        // Active set: the fractional orbitals, plus any pinned orbital
+        // whose energy puts it on the wrong side of the chemical
+        // potential.
+        bool any_step = false;
+        for(Index iparticle = 0;
+            iparticle < number_of_blocks_per_particle_type_.size();
+            iparticle++) {
+          std::vector<std::pair<size_t, size_t>> active;
+          std::vector<Tbase> active_eps;
+          std::vector<Tbase> fractional_eps;
+          for(const auto & level : order_orbitals_by_energy(eps, iparticle)) {
+            const size_t iblock = std::get<1>(level);
+            const size_t iorb = std::get<2>(level);
+            const Tbase n = occupations[iblock](iorb);
+            if(n > occupation_change_threshold_
+               && maximum_occupation_(iblock) - n > occupation_change_threshold_)
+              fractional_eps.push_back(std::get<0>(level));
+          }
+          if(fractional_eps.empty()) {
+            log_(5, "KKT refinement: particle %i has no fractional"
+                    " occupations.\n", (int) iparticle);
+            continue;
+          }
+          Tbase mu = 0;
+          for(Tbase e : fractional_eps) mu += e;
+          mu /= (Tbase) fractional_eps.size();
+
+          for(const auto & level : order_orbitals_by_energy(eps, iparticle)) {
+            const Tbase energy = std::get<0>(level);
+            const size_t iblock = std::get<1>(level);
+            const size_t iorb = std::get<2>(level);
+            const Tbase n = occupations[iblock](iorb);
+            const bool is_empty = n <= occupation_change_threshold_;
+            const bool is_full =
+              maximum_occupation_(iblock) - n <= occupation_change_threshold_;
+            const bool wrong_side =
+              (is_empty && energy < mu) || (is_full && energy > mu);
+            if((!is_empty && !is_full) || wrong_side) {
+              active.emplace_back(iblock, iorb);
+              active_eps.push_back(energy);
+            }
+          }
+          if(active.size() < 2) {
+            log_(5, "KKT refinement: particle %i has %zu active orbitals,"
+                    " nothing to transfer between.\n", (int) iparticle,
+                 active.size());
+            continue;
+          }
+
+          // Transfer directions against the first active orbital.
+          const Index ndir = (Index) active.size() - 1;
+          Vector<Tbase> g(ndir);
+          for(Index m = 0; m < ndir; m++)
+            g(m) = active_eps[m + 1] - active_eps[0];
+          if(!(g.cwiseAbs().maxCoeff() > kkt_occupation_threshold_)) {
+            log_(5, "KKT refinement: particle %i gradient %e below"
+                    " threshold.\n", (int) iparticle,
+                 (double) g.cwiseAbs().maxCoeff());
+            continue;
+          }
+
+          // Curvature by second differences of the perturbatively
+          // relaxed energy along those directions.
+          const Tbase h = kkt_occupation_probe_;
+          auto shifted_energy = [&](const Vector<Tbase> & lambda) {
+            auto trial = occupations;
+            for(Index m = 0; m < ndir; m++) {
+              trial[active[m + 1].first](active[m + 1].second) += lambda(m);
+              trial[active[0].first](active[0].second) -= lambda(m);
+            }
+            for(size_t b = 0; b < trial.size(); b++)
+              for(Index k = 0; k < trial[b].size(); k++)
+                trial[b](k) = std::min(maximum_occupation_(b),
+                                       std::max(Tbase(0), trial[b](k)));
+            initialize_with_orbitals(get_orbitals(), trial);
+            return get_energy() + perturbative_relaxation_energy_();
+          };
+
+          const Vector<Tbase> zero = Vector<Tbase>::Zero(ndir);
+          const Tbase E0 = shifted_energy(zero);
+          std::vector<Tbase> E_plus(ndir), E_minus(ndir);
+          for(Index m = 0; m < ndir; m++) {
+            Vector<Tbase> lp = zero, lm = zero;
+            lp(m) = h;
+            lm(m) = -h;
+            E_plus[m] = shifted_energy(lp);
+            E_minus[m] = shifted_energy(lm);
+          }
+          Matrix<Tbase> H(ndir, ndir);
+          for(Index m = 0; m < ndir; m++)
+            H(m, m) = (E_plus[m] - Tbase(2) * E0 + E_minus[m]) / (h * h);
+          for(Index m = 0; m < ndir; m++)
+            for(Index n2 = m + 1; n2 < ndir; n2++) {
+              Vector<Tbase> lmn = zero;
+              lmn(m) = h;
+              lmn(n2) = h;
+              const Tbase E_mn = shifted_energy(lmn);
+              const Tbase mixed =
+                (E_mn - E_plus[m] - E_plus[n2] + E0) / (h * h);
+              H(m, n2) = mixed;
+              H(n2, m) = mixed;
+            }
+          initialize_with_orbitals(state_before.first, state_before.second);
+
+          // Shift the curvature onto the positive cone: a Newton step
+          // on an indefinite model walks uphill.
+          Eigen::SelfAdjointEigenSolver<Matrix<Tbase>> es(H);
+          if(es.info() != Eigen::Success) continue;
+          Vector<Tbase> ev = es.eigenvalues();
+          const Tbase floor_value =
+            std::max(kkt_occupation_threshold_.get(),
+                     Tbase(1e-3) * ev.cwiseAbs().maxCoeff());
+          for(Index m = 0; m < ndir; m++) ev(m) = std::max(ev(m), floor_value);
+          const Matrix<Tbase> H_shifted =
+            es.eigenvectors() * ev.asDiagonal() * es.eigenvectors().transpose();
+
+          const Vector<Tbase> step = H_shifted.ldlt().solve(-g);
+          if(!step.allFinite()) continue;
+
+          // Scale the step back to the feasible box rather than
+          // discarding it. The Newton direction is computed from a
+          // curvature that can be small, so it routinely overshoots a
+          // bound -- and an occupation reaching a bound is the active
+          // set telling us that orbital wants to pin, not a reason to
+          // stand still. Walk as far along the direction as the bounds
+          // allow.
+          Tbase alpha = 1;
+          for(Index m = 0; m < ndir; m++) {
+            const auto & to = active[m + 1];
+            const auto & from = active[0];
+            const Tbase n_to = occupations[to.first](to.second);
+            const Tbase n_from = occupations[from.first](from.second);
+            const Tbase d_to = step(m), d_from = -step(m);
+            if(d_to > 0)
+              alpha = std::min(alpha,
+                               (maximum_occupation_(to.first) - n_to) / d_to);
+            else if(d_to < 0)
+              alpha = std::min(alpha, -n_to / d_to);
+            if(d_from > 0)
+              alpha = std::min(alpha,
+                               (maximum_occupation_(from.first) - n_from)
+                                 / d_from);
+            else if(d_from < 0)
+              alpha = std::min(alpha, -n_from / d_from);
+          }
+          // Stop just short of the bound so the orbital stays in the
+          // active set rather than pinning on a rounding error.
+          alpha *= Tbase(0.99);
+          // And no further than the trust radius, the curvature above
+          // being too noisy to be trusted with the step length.
+          const Tbase longest = step.cwiseAbs().maxCoeff();
+          if(longest > 0 && alpha * longest > trust)
+            alpha = trust / longest;
+          if(!(alpha > 0) || !std::isfinite((double) alpha)) {
+            log_(5, "KKT refinement: particle %i has no feasible step.\n",
+                 (int) iparticle);
+            continue;
+          }
+          if(alpha < Tbase(1))
+            log_(5, "KKT refinement: particle %i step scaled by %e to stay"
+                    " within the occupation bounds.\n", (int) iparticle,
+                 (double) alpha);
+
+          auto trial = occupations;
+          for(Index m = 0; m < ndir; m++) {
+            trial[active[m + 1].first](active[m + 1].second) += alpha * step(m);
+            trial[active[0].first](active[0].second) -= alpha * step(m);
+          }
+          for(size_t b = 0; b < trial.size(); b++)
+            for(Index k = 0; k < trial[b].size(); k++)
+              trial[b](k) = std::min(maximum_occupation_(b),
+                                     std::max(Tbase(0), trial[b](k)));
+
+          initialize_with_orbitals(get_orbitals(), trial);
+          relax_orbitals_at_fixed_occupations_(allowed);
+          const Tbase E_after = get_energy();
+          const Tbase residual_after = fermi_level_error();
+          if(E_after <= E_before && residual_after < residual_before) {
+            // Double on success, quarter on failure. The trajectory
+            // this produces alternates accept and reject, which looks
+            // wasteful -- but tying the radius to the length that was
+            // actually taken instead, so that it contracts with the
+            // problem, measured worse on both counts: the residual
+            // ended 6 to 50 times higher and there were *more*
+            // rejections, not fewer. The rejections are not about the
+            // step length. The direction comes from a curvature
+            // estimated by second differences of energies agreeing to
+            // nine decimals, and a shorter step in a poor direction is
+            // still a poor step.
+            const Tbase grown =
+              std::min(kkt_occupation_trust_radius_.get(), trust * Tbase(2));
+            log_(5, "KKT occupation refinement: residual %e -> %e,"
+                    " energy change %e; trust radius %e -> %e\n",
+                 (double) residual_before, (double) residual_after,
+                 (double) (E_after - E_before), (double) trust,
+                 (double) grown);
+            trust = grown;
+            improved = true;
+            any_step = true;
+          } else {
+            log_(5, "KKT occupation refinement: step rejected"
+                    " (residual %e -> %e, energy change %e); trust radius"
+                    " %e -> %e.\n",
+                 (double) residual_before, (double) residual_after,
+                 (double) (E_after - E_before), (double) trust,
+                 (double) (trust / Tbase(4)));
+            initialize_with_orbitals(state_before.first, state_before.second);
+            trust /= Tbase(4);
+            any_step = true;   // a shrunk radius is worth another sweep
+          }
+        }
+        if(!any_step) break;
+      }
+      return improved;
+    }
+
+    /// Residual of the conditions the occupations have to satisfy at a
+    /// minimum, in energy units.
+    ///
+    /// Minimising the energy over the occupations subject to a fixed
+    /// particle number and 0 <= n <= n_max gives, with a chemical
+    /// potential mu and Janak's dE/dn_k = eps_k,
+    ///
+    ///     eps_k  = mu      where 0 < n_k < n_max   (fractional)
+    ///     eps_k >= mu      where n_k = 0           (empty)
+    ///     eps_k <= mu      where n_k = n_max       (full)
+    ///
+    /// This returns the largest violation of any of the three over the
+    /// particle types. ``aufbau_error`` tests the two inequalities in
+    /// occupation units and exempts everything inside the Fermi-level
+    /// cluster, fractional occupation being legitimate exactly there
+    /// -- so the equality, which is the condition that fixes *where*
+    /// inside the cluster the fractions sit, went unmeasured.
+    ///
+    /// Measuring it in energy units rather than occupation units is
+    /// the point. Near a stationary point the energy is quadratic in
+    /// the occupation displacement while these residuals are linear,
+    /// so a criterion built on energy decrease is insensitive to
+    /// exactly the displacements this catches. Measured on a
+    /// spin-restricted iron atom, two runs of the same command settled
+    /// at 4s/3d fractions 0.005 apart, 2e-6 Eh apart, both reporting
+    /// convergence by every other diagnostic the solver carries.
+    ///
+    /// mu is taken as the mean orbital energy over the fractionally
+    /// occupied orbitals. Where there are none it is not determined by
+    /// the equality at all, and any value between the highest full and
+    /// the lowest empty orbital satisfies the inequalities, so the
+    /// residual is how far those two have crossed.
+    Tbase fermi_level_error() const {
+      if(orbital_history_.empty() || frozen_occupations_) return 0;
+
+      Orbitals<Torb> C_pseudo;
+      OrbitalEnergies<Tbase> eps;
+      const auto occupations = get_orbital_occupations();
+      pseudo_canonicalise_(get_orbitals(), get_fock_matrix(), occupations,
+                           C_pseudo, eps);
+
+      Tbase worst = 0;
+      for(Index iparticle = 0;
+          iparticle < number_of_blocks_per_particle_type_.size(); iparticle++) {
+        std::vector<Tbase> fractional, empty, full;
+        for(const auto & level : order_orbitals_by_energy(eps, iparticle)) {
+          const Tbase energy = std::get<0>(level);
+          const size_t iblock = std::get<1>(level);
+          const size_t iorb = std::get<2>(level);
+          const Tbase n = occupations[iblock](iorb);
+          if(n <= occupation_change_threshold_)
+            empty.push_back(energy);
+          else if(maximum_occupation_(iblock) - n <= occupation_change_threshold_)
+            full.push_back(energy);
+          else
+            fractional.push_back(energy);
+        }
+
+        if(fractional.empty()) {
+          // mu is free between the bands; only a crossing is a
+          // violation.
+          if(!full.empty() && !empty.empty()) {
+            const Tbase highest_full =
+              *std::max_element(full.begin(), full.end());
+            const Tbase lowest_empty =
+              *std::min_element(empty.begin(), empty.end());
+            worst = std::max(worst,
+                             std::max(Tbase(0), highest_full - lowest_empty));
+          }
+          continue;
+        }
+
+        Tbase mu = 0;
+        for(Tbase e : fractional) mu += e;
+        mu /= (Tbase) fractional.size();
+
+        for(Tbase e : fractional) worst = std::max(worst, std::abs(e - mu));
+        for(Tbase e : empty) worst = std::max(worst, std::max(Tbase(0), mu - e));
+        for(Tbase e : full) worst = std::max(worst, std::max(Tbase(0), e - mu));
+      }
+      return worst;
+    }
+
     Tbase aufbau_error() const {
       if(orbital_history_.empty() || frozen_occupations_) return 0;
 
@@ -6298,8 +6712,10 @@ namespace OpenOrbitalOptimizer {
         log_(1, "Iteration %i: %i Fock evaluations energy % .10f change % e DIIS error vector %s norm %e\n", (int) iteration, (int) number_of_fock_evaluations_, (double) (get_energy()), (double) (dE), error_norm_.get().c_str(), (double) (diis_error));
         log_(5, "History size %i\n",(int) orbital_history_.size());
         if(verbosity_>=5)
-          log_(5, "Occupations: particle-number error %e, Aufbau error %e\n",
-               (double) (particle_number_error()), (double) (aufbau_error()));
+          log_(5, "Occupations: particle-number error %e, Aufbau error %e,"
+                  " Fermi-level error %e\n",
+               (double) (particle_number_error()), (double) (aufbau_error()),
+               (double) (fermi_level_error()));
         if(verbosity_>=5) {
           const auto occupations = get_orbital_occupations();
           auto occ_idx(occupied_orbitals(occupations));

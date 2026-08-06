@@ -70,6 +70,59 @@
       M = 1 and M = 3 and iron at M = 5 are identical with it on and
       off.
 
+* The occupations are settled onto their stationarity conditions at
+  the end of the Aufbau cleanup, by root-finding on the residual
+  rather than by minimising the energy. New diagnostic
+  ``fermi_level_error`` and three settings,
+  ``kkt_occupation_refinement_steps`` (12),
+  ``kkt_occupation_threshold`` (1e-7) and
+  ``kkt_occupation_trust_radius`` (5e-3).
+    - Minimising the energy over the occupations subject to a fixed
+      particle number and ``0 <= n <= n_max`` gives, with a chemical
+      potential ``mu`` and Janak's ``dE/dn_k = eps_k``,
+      ``eps_k = mu`` where the occupation is fractional, ``eps_k >= mu``
+      where it is zero and ``eps_k <= mu`` where it is maximal.
+      ``aufbau_error`` tests the two inequalities and exempts the
+      Fermi-level cluster, fractional occupation being legitimate
+      exactly there -- so the equality, which is what decides *where*
+      inside that cluster the fractions sit, went unmeasured.
+      ``fermi_level_error`` is the largest violation of any of the
+      three, in energy units.
+    - Why an energy criterion could not find this: near a stationary
+      point the energy is quadratic in the occupation displacement
+      while these residuals are linear. The optimal-damping step
+      stopped on a spin-restricted iron atom with a predicted gain of
+      9.9e-8, just under the 1e-7 below which it declines to churn at
+      the arithmetic floor, and the residual left behind was 1.2e-4.
+    - Measured on iron at M = 5 in cc-pVDZ, the same command
+      reproducibly gave two answers: 224 Fock builds ending at
+      -1263.4350125736 and 300 ending at -1263.4350145596, 2e-6 Eh
+      apart, both reporting convergence, differing only in the beta
+      4s/3d split (0.6501 against 0.6547 electrons). Their Fermi-level
+      residuals were 2.7e-4 and 1.2e-4 -- the higher-energy answer the
+      further from stationarity. With the refinement both paths reach
+      -1263.435014795, agreeing to eleven digits.
+    - The step is chosen by the residual and only checked against the
+      energy: a step that raises it is rejected and the previous state
+      restored, so the rule that nothing is adopted unless it lowers
+      the energy is untouched.
+    - Orbitals pinned full or empty enter through an active set. One
+      on the wrong side of the chemical potential has a descent
+      direction into the fractional region and joins the set; one on
+      its own side is at a legitimate bound and is left alone.
+    - The curvature is a second difference of perturbatively relaxed
+      energies, which agree to nine decimals, so it is too noisy to
+      set a step length; a trust region bounds the step instead. It
+      doubles on success and quarters on failure. Tying it to the
+      length actually accepted, so that it contracts as the problem
+      does, measured worse on both counts -- the residual ended 6 to
+      50 times higher with *more* rejections -- because the rejections
+      are not about the length. A shorter step in a direction taken
+      from noisy curvature is still a poor step.
+    - Costs nothing where there is nothing to settle: oxygen at M = 1
+      and M = 3 and krypton are identical in energy and Fock count
+      with the refinement on and off.
+
 #### Bug Fixes
 
 #### Misc.
