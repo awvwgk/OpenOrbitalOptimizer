@@ -4741,7 +4741,15 @@ namespace OpenOrbitalOptimizer {
       // left set from an earlier run it would make the convergence-
       // time full-polytope check fire on a run that never took a
       // collapsed ODA step at all.
-      number_of_fock_evaluations_ = 0;
+      // A caller that is only relocating the iterate -- moving to trial
+      // occupations and back, say -- is not starting a new calculation,
+      // and the builds it spends are real work that a benchmark has to
+      // see. Zeroing the counter under it makes every later iteration
+      // line report only the builds since the last relocation, which
+      // understated the cost of the occupation refinement by more than
+      // an order of magnitude before this was noticed.
+      if(!relocating_iterate_)
+        number_of_fock_evaluations_ = 0;
       last_oda_via_collapsed_ = false;
       last_polytope_dimension_ = 0;
       add_entry(std::make_pair(orbitals, orbital_occupations));
@@ -6030,6 +6038,70 @@ namespace OpenOrbitalOptimizer {
     /// only Aufbau once the mixing has collapsed onto the minimiser,
     /// so this falls as the SCF converges. Returns 0 when the
     /// occupations are not the solver's to choose.
+    /// Set while a routine is moving the iterate to trial points and
+    /// back rather than starting a fresh calculation. Consulted by
+    /// initialize_with_orbitals, which otherwise resets the
+    /// Fock-evaluation counter.
+    bool relocating_iterate_ = false;
+
+    /// Everything the history-based methods carry between steps.
+    ///
+    /// initialize_with_orbitals clears the orbital history and the
+    /// DIIS caches and starts again from the state it is handed, which
+    /// is what a routine wanting to move the iterate has to use. At
+    /// the end of a run that costs nothing. Called from inside the SCF
+    /// it leaves the state machine running on extrapolation and
+    /// curvature histories that no longer describe where the iterate
+    /// has been -- measured, that segfaulted on the next rotation
+    /// step. Saving and restoring around such a routine keeps the
+    /// relocation local to it.
+    struct HistorySnapshot {
+      OrbitalHistory<Torb, Tbase> history;
+      size_t next_index = 0;
+      std::map<size_t, std::vector<Matrix<Torb>>> commutators;
+      std::map<std::pair<size_t, size_t>, Tbase> trace_DF;
+      std::map<std::pair<size_t, size_t>, Tbase> diis_matrix;
+      std::map<std::pair<size_t, size_t>, Tbase> density_diff;
+      LBFGSState lbfgs;
+      Vector<Tbase> previous_gradient;
+      Vector<Tbase> previous_direction;
+      std::vector<OrbitalRotation> previous_dofs;
+      bool last_oda_collapsed = false;
+      Tbase old_energy = 0;
+    };
+
+    HistorySnapshot save_history_() const {
+      HistorySnapshot snapshot;
+      snapshot.history = orbital_history_;
+      snapshot.next_index = next_history_index_;
+      snapshot.commutators = diis_commutator_cache_;
+      snapshot.trace_DF = trace_DF_cache_;
+      snapshot.diis_matrix = diis_matrix_cache_;
+      snapshot.density_diff = density_diff_cache_;
+      snapshot.lbfgs = lbfgs_;
+      snapshot.previous_gradient = previous_orbital_gradient_;
+      snapshot.previous_direction = previous_orbital_direction_;
+      snapshot.previous_dofs = previous_orbital_dofs_;
+      snapshot.last_oda_collapsed = last_oda_via_collapsed_;
+      snapshot.old_energy = old_energy_;
+      return snapshot;
+    }
+
+    void restore_history_(const HistorySnapshot & snapshot) {
+      orbital_history_ = snapshot.history;
+      next_history_index_ = snapshot.next_index;
+      diis_commutator_cache_ = snapshot.commutators;
+      trace_DF_cache_ = snapshot.trace_DF;
+      diis_matrix_cache_ = snapshot.diis_matrix;
+      density_diff_cache_ = snapshot.density_diff;
+      lbfgs_ = snapshot.lbfgs;
+      previous_orbital_gradient_ = snapshot.previous_gradient;
+      previous_orbital_direction_ = snapshot.previous_direction;
+      previous_orbital_dofs_ = snapshot.previous_dofs;
+      last_oda_via_collapsed_ = snapshot.last_oda_collapsed;
+      old_energy_ = snapshot.old_energy;
+    }
+
     /// Drive the occupations onto the conditions fermi_level_error
     /// measures, by Newton on the residual rather than by minimising
     /// the energy.
@@ -6068,6 +6140,21 @@ namespace OpenOrbitalOptimizer {
         return false;
       }
       if(kkt_occupation_refinement_steps_ <= 0) return false;
+
+      // The sweeps below relocate the iterate with
+      // initialize_with_orbitals, which restarts the orbital history.
+      // Save it, and hand back only the improved iterate as one new
+      // entry, so a caller in the middle of an SCF keeps the history
+      // it was relying on.
+      const HistorySnapshot snapshot = save_history_();
+      // The sweeps move the iterate about; that is relocation, not a
+      // new calculation, so the Fock counter must keep running.
+      struct RelocationGuard {
+        bool * flag;
+        bool saved;
+        ~RelocationGuard() { *flag = saved; }
+      } relocation{&relocating_iterate_, relocating_iterate_};
+      relocating_iterate_ = true;
 
       bool improved = false;
       Tbase trust = kkt_occupation_trust_radius_;
@@ -6297,6 +6384,18 @@ namespace OpenOrbitalOptimizer {
           }
         }
         if(!any_step) break;
+      }
+
+      // Put the history back, then re-enter the improved iterate as a
+      // single new entry. add_entry sorts by energy, so the refined
+      // state takes its place at the head if it earned it.
+      if(improved) {
+        const auto refined_density = std::get<0>(orbital_history_[0]);
+        const auto refined_fock = std::get<1>(orbital_history_[0]);
+        restore_history_(snapshot);
+        add_entry(refined_density, refined_fock);
+      } else {
+        restore_history_(snapshot);
       }
       return improved;
     }

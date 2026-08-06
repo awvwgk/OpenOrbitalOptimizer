@@ -122,6 +122,29 @@
     - Costs nothing where there is nothing to settle: oxygen at M = 1
       and M = 3 and krypton are identical in energy and Fock count
       with the refinement on and off.
+    - The refinement saves and restores the orbital history, the DIIS
+      caches and the rotation-step state around itself, handing back
+      only the improved iterate as one new entry. It moves the iterate
+      with ``initialize_with_orbitals``, which restarts all of that,
+      and a routine that does so from inside an SCF leaves the state
+      machine running on histories that no longer describe where the
+      iterate has been -- measured, that segfaulted on the next
+      rotation step.
+    - Running it after every optimal-damping step rather than once at
+      the end, gated on the residual being in a range where the
+      orbital energies mean something, is safe with that in place and
+      costs about three and a half times more: on iron at M = 5 it
+      reached the same energy with 272 energy evaluations against 75.
+      The refinement is cheap once, where the orbitals have converged
+      and a single relaxation settles the fractions; run while they
+      are still moving it re-relaxes repeatedly and the next rotation
+      step discards the result.
+    - ``initialize_with_orbitals`` no longer zeroes
+      ``number_of_fock_evaluations`` when a caller is relocating the
+      iterate rather than starting a calculation. It did, so the
+      counter restarted every time the refinement moved to a trial
+      point, and the cost of the in-loop experiment above read as 18
+      Fock builds against the true 272.
 
 #### Bug Fixes
 
