@@ -6247,8 +6247,28 @@ namespace OpenOrbitalOptimizer {
             continue;
           }
 
-          // Curvature by second differences of the perturbatively
-          // relaxed energy along those directions.
+          // Curvature by second differences along those directions, of
+          // the energy at fixed orbitals.
+          //
+          // Adding the perturbative estimate of the orbital relaxation
+          // here, so as to model the relaxed surface the accept test
+          // measures, does not work: it inverts the curvature. The
+          // estimate vanishes at the centre, where the orbitals are
+          // already relaxed, and is negative at both probes, so the
+          // second difference picks up almost nothing but the
+          // artefact. On a spin-restricted iron atom the 4s-3d
+          // transfer has curvature +0.31 at fixed orbitals and -0.54
+          // once the estimate is added, and the fully relaxed energies
+          // say the positive one is right -- a transfer of 5e-3 raises
+          // the energy by 8e-7, where the negative curvature predicts a
+          // drop ten times that. The consequence of the wrong sign was
+          // not a wrong answer but a slow one: the negative eigenvalue
+          // was floored onto the positive cone, which turns the Newton
+          // step into a step of unbounded length, and it was then
+          // clipped to the trust radius. Every sweep therefore
+          // proposed the longest step allowed, overshot, was rejected
+          // on a worsened residual, and quartered the radius, so the
+          // refinement crept in over the noise instead of converging.
           const Tbase h = kkt_occupation_probe_;
           auto shifted_energy = [&](const Vector<Tbase> & lambda) {
             auto trial = occupations;
@@ -6261,7 +6281,7 @@ namespace OpenOrbitalOptimizer {
                 trial[b](k) = std::min(maximum_occupation_(b),
                                        std::max(Tbase(0), trial[b](k)));
             initialize_with_orbitals(get_orbitals(), trial);
-            return get_energy() + perturbative_relaxation_energy_();
+            return get_energy();
           };
 
           const Vector<Tbase> zero = Vector<Tbase>::Zero(ndir);
@@ -6376,18 +6396,43 @@ namespace OpenOrbitalOptimizer {
           relax_orbitals_at_fixed_occupations_(allowed);
           const Tbase E_after = get_energy();
           const Tbase residual_after = fermi_level_error();
+          // Both tests are needed, and neither is comfortable.
+          //
+          // The residual is first order in the occupation step, the
+          // energy second: near the stationary point a step changes
+          // the residual by H*dn but the energy only by H*dn^2/2. The
+          // energy signal therefore dies as the *square* of the
+          // residual and drops below the noise floor while the
+          // residual is still far above its own. With a curvature of
+          // 0.3 and an energy reproducible to about 1e-9, the energy
+          // comparison carries signal only while the residual exceeds
+          // 2e-5, yet it is asked to veto steps at 3e-6. Those
+          // verdicts are noise, and each one either wastes a
+          // relaxation or quarters the trust radius, which then takes
+          // two more sweeps to win back.
+          //
+          // Dropping the energy test is nonetheless wrong. It lets a
+          // spin-restricted iron atom converge two orders further, to
+          // 1e-8 in 260 Fock builds rather than 1e-6 in 302, but costs
+          // the M = 5 case an order of magnitude, ending at 1e-5 where
+          // the energy test holds it below 1e-6. The residual cannot
+          // see which of several stationary points is the lower one;
+          // only the energy can. Admitting a margin does not split the
+          // difference either -- any margin wide enough to silence the
+          // noise verdicts is wide enough to admit the steps that
+          // wander, and reproduces the dropped-test numbers exactly.
+          //
+          // What this wants is a criterion that knows which question
+          // it is answering: the energy while the step is large enough
+          // to be heard and the stationary point is still in doubt,
+          // the residual once the point is settled and only its
+          // precision is at stake.
           if(E_after <= E_before && residual_after < residual_before) {
-            // Double on success, quarter on failure. The trajectory
-            // this produces alternates accept and reject, which looks
-            // wasteful -- but tying the radius to the length that was
-            // actually taken instead, so that it contracts with the
-            // problem, measured worse on both counts: the residual
-            // ended 6 to 50 times higher and there were *more*
-            // rejections, not fewer. The rejections are not about the
-            // step length. The direction comes from a curvature
-            // estimated by second differences of energies agreeing to
-            // nine decimals, and a shorter step in a poor direction is
-            // still a poor step.
+            // Double on success, quarter on failure. Tying the radius
+            // to the length actually taken instead, so that it
+            // contracts with the problem, measured worse on both
+            // counts: the residual ended 6 to 50 times higher and
+            // there were *more* rejections, not fewer.
             const Tbase grown =
               std::min(kkt_occupation_trust_radius_.get(), trust * Tbase(2));
             log_(5, "KKT occupation refinement: residual %e -> %e,"

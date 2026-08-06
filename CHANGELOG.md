@@ -27,6 +27,25 @@
       integrals.
 
 #### Enhancements (continued)
+* The occupation curvature used by the KKT refinement is taken from
+  the energy at fixed orbitals, not from the energy plus the
+  perturbative estimate of the orbital relaxation. Adding the
+  estimate inverted it. The estimate vanishes at the centre of the
+  probe, where the orbitals are already relaxed, and is negative at
+  both displaced points, so the second difference measured almost
+  nothing but that artefact: on a spin-restricted iron atom the
+  4s-3d transfer came out at -0.54 where the fixed-orbital value is
+  +0.31, and the fully relaxed energies say the positive one is
+  right.
+    - The wrong sign cost speed, not accuracy. A negative eigenvalue
+      is floored onto the positive cone before the Newton solve,
+      which makes the step unboundedly long, and it was then clipped
+      to the trust radius. Every sweep therefore proposed the longest
+      step permitted, overshot, was rejected on a worsened residual
+      and quartered the radius, so the refinement crept in over the
+      noise. Iron at M = 0 settles in 302 Fock evaluations rather
+      than 327 on a performance core, and 239 rather than 258 on an
+      efficiency one.
 * The Aufbau cleanup prints an iteration history of its own at
   verbosity 5, in the same shape as the one ``run()`` prints: the
   running Fock count, the energy and its change, the
