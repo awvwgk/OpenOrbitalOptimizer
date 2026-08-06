@@ -1300,6 +1300,9 @@ int main(int argc, char **argv) {
   parser.add<bool>("oda", 0, "Use optimal damping for SCF?", false, false);
   parser.add<std::string>("methods", 0, "SCF method mix (e.g. \"LCIIS + ODA + CG\"); empty = driver default", false, "");
   parser.add<std::string>("set", 0, "extra solver settings as key=value[,key=value]", false, "");
+  parser.add<double>("reference-energy", 0, "total energy the run must reproduce; omitted = not checked", false, 0.0);
+  parser.add<double>("energy-tolerance", 0, "tolerance on --reference-energy", false, 1e-8);
+  parser.add<double>("max-fermi-level-error", 0, "largest tolerated occupation stationarity residual; negative = not checked", false, -1.0);
   parser.add<double>("odadegthresh", 0, "Energy gap below which orbitals are treated as degenerate in optimal damping (0 = use solver default)", false, 0.0);
   parser.parse_check(argc, argv);
 
@@ -1319,6 +1322,10 @@ int main(int argc, char **argv) {
   bool quad = parser.get<bool>("quad");
   bool oda = parser.get<bool>("oda");
   std::string methods_override = parser.get<std::string>("methods");
+  const bool check_energy = parser.exist("reference-energy");
+  const double reference_energy = parser.get<double>("reference-energy");
+  const double energy_tolerance = parser.get<double>("energy-tolerance");
+  const double max_fermi_level_error = parser.get<double>("max-fermi-level-error");
   g_settings_override = parser.get<std::string>("set");
   double oda_degeneracy_threshold = parser.get<double>("odadegthresh");
   std::string basisfile = parser.get<std::string>("basis");
@@ -1394,6 +1401,38 @@ int main(int argc, char **argv) {
         printf("Particle number is not conserved: |difference| %e exceeds %e\n",
                std::abs(total - expected), tolerance);
         return false;
+      }
+
+      // Without these a regression test only asserts that the driver
+      // did not crash: the run can converge to the wrong answer, or
+      // not converge at all, and still be reported as a pass.
+      if(!scfsolver.converged()) {
+        printf("SCF did not converge.\n");
+        return false;
+      }
+      if(check_energy) {
+        const double energy = scfsolver.get_energy();
+        printf("Energy % .10f, reference % .10f, difference %e\n",
+               energy, reference_energy, energy - reference_energy);
+        if(std::abs(energy - reference_energy) > energy_tolerance) {
+          printf("Energy differs from the reference by more than %e\n",
+                 energy_tolerance);
+          return false;
+        }
+      }
+      if(max_fermi_level_error >= 0.0) {
+        // The occupations of a fractionally filled shell are only
+        // determined once the orbitals sharing the Fermi level have a
+        // common orbital energy; without this the shell can settle
+        // anywhere along a very flat valley and the energy alone will
+        // not say so.
+        const double residual = scfsolver.get_real("fermi_level_error");
+        printf("Fermi-level error %e, tolerance %e\n", residual,
+               max_fermi_level_error);
+        if(residual > max_fermi_level_error) {
+          printf("Occupations are not stationary.\n");
+          return false;
+        }
       }
       return true;
     };
