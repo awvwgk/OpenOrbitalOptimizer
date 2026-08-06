@@ -33,9 +33,33 @@ add_test(  # Test #3
   NAME openorbopt/atomtest/run2
   COMMAND $<TARGET_FILE:openorbopt-atomtest> --Z 8 --xfunc GGA_X_PBE --cfunc GGA_C_PBE --M 3 --basis "${CMAKE_CURRENT_SOURCE_DIR}/cc-pvdz.json" --reference-energy -74.9722875549 --energy-tolerance 1e-8
   )
+# Transition metals. These are the cases where the occupations of a
+# fractionally filled shell are free to settle anywhere along a very
+# flat valley -- iron shares its valence between 4s and 3d -- and
+# before the occupations were held to their stationarity conditions
+# the same command reproducibly gave two different answers 2e-6 Eh
+# apart, both reporting convergence. There was nothing stable to
+# assert until then, which is why they are only now in CI.
+#
+# They are run without DIIS. The extrapolation converges these cases
+# on its own and the orbital-rotation step barely runs, so a mix
+# containing it would not exercise what these tests are here for.
+#
+# Each takes three to five minutes, comparable to the instantiation
+# builds below.
+add_test(  # Test #4
+  NAME openorbopt/atomtest/iron-unrestricted
+  COMMAND $<TARGET_FILE:openorbopt-atomtest> --Z 26 --M 5 --xfunc GGA_X_PBE --cfunc GGA_C_PBE --basis "${CMAKE_CURRENT_SOURCE_DIR}/cc-pvdz.json" --methods "ODA + ARH" --reference-energy -1263.4350147950 --energy-tolerance 1e-7 --max-fermi-level-error 1e-5
+  )
+add_test(  # Test #5
+  NAME openorbopt/atomtest/iron-restricted
+  COMMAND $<TARGET_FILE:openorbopt-atomtest> --Z 26 --M 0 --xfunc GGA_X_PBE --cfunc GGA_C_PBE --basis "${CMAKE_CURRENT_SOURCE_DIR}/cc-pvdz.json" --methods "ODA + ARH" --reference-energy -1263.3342431303 --energy-tolerance 1e-6 --max-fermi-level-error 1e-4
+  )
 set_tests_properties(
   openorbopt/atomtest/run1
   openorbopt/atomtest/run2
+  openorbopt/atomtest/iron-unrestricted
+  openorbopt/atomtest/iron-restricted
   PROPERTIES
     FIXTURES_REQUIRED OPENORBOPT_ATOMTEST_EXEC
   )
