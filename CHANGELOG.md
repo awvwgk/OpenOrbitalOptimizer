@@ -27,6 +27,25 @@
       integrals.
 
 #### Enhancements (continued)
+* The Aufbau cleanup prints an iteration history of its own at
+  verbosity 5, in the same shape as the one ``run()`` prints: the
+  running Fock count, the energy and its change, the
+  particle-number, Aufbau and Fermi-level errors, the occupations of
+  every block, and a line naming the fractionally occupied orbitals
+  with their occupations and orbital energies. On a spin-restricted
+  iron atom that last line is the interesting one -- it shows the 4s
+  and 3d occupations settling with their orbital energies equal to
+  six digits, which is the stationarity condition the cleanup is
+  there to reach, and it was previously invisible.
+* The Fock-evaluation counter no longer restarts inside the Aufbau
+  cleanup. The cleanup relocates the iterate -- it samples trial
+  occupations, relaxes the orbitals at them and moves back -- and
+  each relocation went through ``initialize_with_orbitals``, which
+  zeroes the counter. The cleanup therefore reported a fraction of
+  the work it had done: on a spin-restricted iron atom it printed 71
+  Fock builds where it had spent about 210. Since that phase is the
+  larger part of the run on such a case, the number is worth having
+  right.
 * The Aufbau cleanup's relaxed occupation Hessian is estimated from
   perturbation theory rather than built by relaxing the orbitals at
   each polytope vertex. New setting

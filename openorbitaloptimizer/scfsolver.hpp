@@ -5704,6 +5704,8 @@ namespace OpenOrbitalOptimizer {
         log_stream_(5) << "Relaxed polytope: lambda = "
                        << lambda_star.transpose() << ", E = " << E_star
                        << " (estimated " << E_estimated << ")" << std::endl;
+        log_occupation_iterate_("Relaxed polytope", (int) refinement,
+                                E_star - anchor_energy);
         if(E_star < best_energy) {
           best_energy = E_star;
           best_state = get_solution();
@@ -5792,6 +5794,18 @@ namespace OpenOrbitalOptimizer {
         return false;
       }
       log_(5, "Aufbau cleanup: choosing occupations, then relaxing at them.\n");
+
+      // The whole cleanup relocates the iterate -- it samples trial
+      // occupations, relaxes at them and moves back -- so the
+      // Fock-evaluation counter has to keep running across it. Guarding
+      // only the refinement left the polytope walk resetting it, and
+      // the phase then reported 71 builds where it had spent about 210.
+      struct RelocationGuard {
+        bool * flag;
+        bool saved;
+        ~RelocationGuard() { *flag = saved; }
+      } relocation{&relocating_iterate_, relocating_iterate_};
+      relocating_iterate_ = true;
 
       // Everything below runs on a scratch iterate; keep what it would
       // otherwise overwrite.
@@ -6345,6 +6359,19 @@ namespace OpenOrbitalOptimizer {
               trial[b](k) = std::min(maximum_occupation_(b),
                                      std::max(Tbase(0), trial[b](k)));
 
+          // The relaxation here is the expensive part of the sweep, and
+          // screening it with the perturbative estimate -- rejecting
+          // the step when the estimated relaxed energy rises, which is
+          // free because the estimate only re-reads the Fock matrix
+          // just built -- does not pay: measured on iron M=0 it
+          // changed the Fock count by 331 against 327, inside the
+          // spread of two runs of the same code. It fires on one
+          // rejection in eight. Most rejections happen where the
+          // energy moves by 1e-9 or less, which is below the
+          // estimate's own accuracy, so it predicts the wrong sign;
+          // and a couple are rejected on the residual, which an energy
+          // screen cannot see. The cost lives in the sweeps that are
+          // accepted and grinding, not the ones turned away.
           initialize_with_orbitals(get_orbitals(), trial);
           relax_orbitals_at_fixed_occupations_(allowed);
           const Tbase E_after = get_energy();
@@ -6371,6 +6398,8 @@ namespace OpenOrbitalOptimizer {
             trust = grown;
             improved = true;
             any_step = true;
+            log_occupation_iterate_("Occupation refinement", sweep,
+                                    E_after - E_before);
           } else {
             log_(5, "KKT occupation refinement: step rejected"
                     " (residual %e -> %e, energy change %e); trust radius"
@@ -6398,6 +6427,59 @@ namespace OpenOrbitalOptimizer {
         restore_history_(snapshot);
       }
       return improved;
+    }
+
+    /// Report the iterate the way run() reports an SCF iteration.
+    ///
+    /// The cleanup and the occupation refinement move the occupations
+    /// around after the SCF loop has stopped printing, so without this
+    /// the phase that decides how a fractionally filled shell is
+    /// divided is the one phase with no iteration history to read.
+    /// Same quantities, same order, so the two can be followed as one
+    /// trace.
+    void log_occupation_iterate_(const char * tag, int step,
+                                 Tbase energy_change) {
+      if(verbosity_ < 5) return;
+      log_(5, "%s step %i: %i Fock evaluations energy % .10f change % e\n",
+           tag, step, (int) number_of_fock_evaluations_,
+           (double) get_energy(), (double) energy_change);
+      log_(5, "Occupations: particle-number error %e, Aufbau error %e,"
+              " Fermi-level error %e\n",
+           (double) particle_number_error(), (double) aufbau_error(),
+           (double) fermi_level_error());
+      const auto occupations = get_orbital_occupations();
+      const auto occ_idx = occupied_orbitals(occupations);
+      for(size_t l = 0; l < occ_idx.size(); l++)
+        if(occ_idx[l].size())
+          log_stream_(5) << block_descriptions_[l] + " occupations: "
+                         << occupations[l].head(occ_idx[l].maxCoeff() + 1).transpose()
+                         << std::endl;
+      // The orbitals sharing the Fermi level are the ones whose
+      // occupations are free, so name them: a fractional occupation is
+      // only meaningful against the degeneracy it sits in.
+      Orbitals<Torb> C_pseudo;
+      OrbitalEnergies<Tbase> eps;
+      pseudo_canonicalise_(get_orbitals(), get_fock_matrix(), occupations,
+                           C_pseudo, eps);
+      for(Index iparticle = 0;
+          iparticle < number_of_blocks_per_particle_type_.size(); iparticle++) {
+        std::ostringstream oss;
+        size_t count = 0;
+        for(const auto & level : order_orbitals_by_energy(eps, iparticle)) {
+          const size_t iblock = std::get<1>(level);
+          const size_t iorb = std::get<2>(level);
+          const Tbase n = occupations[iblock](iorb);
+          if(n <= occupation_change_threshold_) continue;
+          if(maximum_occupation_(iblock) - n <= occupation_change_threshold_)
+            continue;
+          oss << " " << block_descriptions_[iblock] << "#" << iorb
+              << " n=" << (double) n << " eps=" << (double) std::get<0>(level);
+          count++;
+        }
+        if(count)
+          log_(5, "Fractionally occupied (particle %i):%s\n", (int) iparticle,
+               oss.str().c_str());
+      }
     }
 
     /// Residual of the conditions the occupations have to satisfy at a
