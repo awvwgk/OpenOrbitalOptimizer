@@ -5954,8 +5954,35 @@ namespace OpenOrbitalOptimizer {
       // belong. The conditions fermi_level_error measures are linear
       // in that displacement and settle it directly -- the same job as
       // this routine's, finished with the instrument that can see it.
-      kkt_occupation_refinement_(allowed);
+      if(kkt_occupation_refinement_(allowed) && must_stay_converged
+         && !converged()) {
+        // The refinement settles the occupations, and moving them is
+        // an orbital perturbation: the orbitals that were stationary
+        // for the old division of the shell are not stationary for
+        // the new one. It relaxes at every trial it takes, but hands
+        // back a single history entry, so the state the caller sees
+        // has never had its gradient minimised from where it now
+        // stands -- and the caller refuses a swap that costs the
+        // convergence criterion, so the whole cleanup was being
+        // dropped over it, a gain of 7e-7 Eh on iron going with it.
+        log_(5, "Aufbau cleanup: the refined occupations leave the gradient"
+                " at %e; relaxing the orbitals at them.\n",
+             (double) norm(diis_error_vector(0)));
+        for(size_t attempt = 0; attempt < 4 && !converged(); attempt++)
+          relax_orbitals_at_fixed_occupations_(allowed);
+        log_(5, "Aufbau cleanup: gradient now %e, %s.\n",
+             (double) norm(diis_error_vector(0)),
+             converged() ? "converged" : "still short");
+      }
 
+      // The refinement is held to the same tolerance the walk is. It
+      // is allowed to climb, but only by an amount below the scale
+      // the solver treats as a real energy difference, so this
+      // comparison cannot undo a move it was let make. Widening it to
+      // the convergence threshold instead, to give the refinement
+      // room, does undo things -- it leaves a state 7e-7 above the
+      // one the walk had already found, that deficit now sitting
+      // under the bar that would have restored it.
       if(!best_state.first.empty()
          && get_energy() > best_energy + minimum_useful_descent_()) {
         cleanup_fock_evaluations += number_of_fock_evaluations_;
@@ -6171,6 +6198,45 @@ namespace OpenOrbitalOptimizer {
       relocating_iterate_ = true;
 
       bool improved = false;
+
+      // Curvature carried between sweeps, one record per particle
+      // type. The probes below measure the curvature at *fixed*
+      // orbitals, but every step is judged after the orbitals have
+      // relaxed, and relaxation screens the occupation curvature --
+      // the fixed-orbital value is an upper bound on the one that
+      // governs the iteration. On a spin-restricted iron atom the two
+      // happen to agree and the refinement converges quadratically;
+      // on the M = 5 atom the fixed-orbital curvature is about four
+      // times too stiff, every Newton step comes out four times too
+      // short, and the residual then contracts by a constant 0.758 a
+      // sweep -- linear convergence, which runs out of sweeps at 1e-5
+      // instead of arriving. Raising the arithmetic does not touch it:
+      // the residual is the same in double, in long double and in
+      // quadruple precision.
+      //
+      // The relaxed curvature does not have to be modelled, only
+      // read. Each accepted sweep leaves a step dn and, at the head of
+      // the next sweep, the orbital energies it produced *after*
+      // relaxation, so the secant condition H dn = deps holds for
+      // exactly the curvature that governs the iteration. The
+      // symmetric rank-one update imposes it while keeping H
+      // symmetric, and costs nothing: both halves of the pair are
+      // already computed.
+      struct SecantRecord {
+        std::vector<std::pair<size_t, size_t>> active;
+        Matrix<Tbase> H;
+        Vector<Tbase> eps_previous;
+        Vector<Tbase> step_previous;
+        bool has_curvature = false;
+        bool has_pair = false;
+      };
+      std::vector<SecantRecord> secant(number_of_blocks_per_particle_type_.size());
+
+      // Where the refinement started, so that the climb it is allowed
+      // is bounded over the whole of it rather than per step.
+      const Tbase entry_energy = get_energy();
+      DensityMatrix<Torb, Tbase> accepted_density;
+      FockBuilderReturn<Torb, Tbase> accepted_fock;
       Tbase trust = kkt_occupation_trust_radius_;
       for(int sweep = 0; sweep < kkt_occupation_refinement_steps_; sweep++) {
         const Tbase residual_before = fermi_level_error();
@@ -6235,145 +6301,202 @@ namespace OpenOrbitalOptimizer {
             continue;
           }
 
-          // Transfer directions against the first active orbital.
-          const Index ndir = (Index) active.size() - 1;
-          Vector<Tbase> g(ndir);
-          for(Index m = 0; m < ndir; m++)
-            g(m) = active_eps[m + 1] - active_eps[0];
-          if(!(g.cwiseAbs().maxCoeff() > kkt_occupation_threshold_)) {
-            log_(5, "KKT refinement: particle %i gradient %e below"
-                    " threshold.\n", (int) iparticle,
-                 (double) g.cwiseAbs().maxCoeff());
-            continue;
-          }
-
-          // Curvature by second differences along those directions, of
-          // the energy at fixed orbitals.
+          // The step is expressed in the occupations themselves,
+          // with the particle number carried by an explicit
+          // multiplier, rather than as transfers against one chosen
+          // active orbital. What we want is the point where every
+          // active orbital shares a chemical potential,
           //
-          // Adding the perturbative estimate of the orbital relaxation
-          // here, so as to model the relaxed surface the accept test
-          // measures, does not work: it inverts the curvature. The
-          // estimate vanishes at the centre, where the orbitals are
-          // already relaxed, and is negative at both probes, so the
-          // second difference picks up almost nothing but the
-          // artefact. On a spin-restricted iron atom the 4s-3d
-          // transfer has curvature +0.31 at fixed orbitals and -0.54
-          // once the estimate is added, and the fully relaxed energies
-          // say the positive one is right -- a transfer of 5e-3 raises
-          // the energy by 8e-7, where the negative curvature predicts a
-          // drop ten times that. The consequence of the wrong sign was
-          // not a wrong answer but a slow one: the negative eigenvalue
-          // was floored onto the positive cone, which turns the Newton
-          // step into a step of unbounded length, and it was then
-          // clipped to the trust radius. Every sweep therefore
-          // proposed the longest step allowed, overshot, was rejected
-          // on a worsened residual, and quartered the radius, so the
-          // refinement crept in over the noise instead of converging.
+          //   eps_k + sum_l H_kl dn_l = mu,   sum_l dn_l = 0,
+          //
+          // which is the bordered system solved below. Two things
+          // follow from writing it this way. mu comes out of the
+          // solve instead of being averaged over the fractional
+          // orbitals, and taking an orbital out of the active set is
+          // the deletion of a row and a column -- which is what makes
+          // the bound handling below expressible at all. In the
+          // transfer parametrisation the reference orbital appears in
+          // every coordinate, so pinning *it* redefines all of them.
+          const Index m_active = (Index) active.size();
+          Vector<Tbase> eps_active(m_active);
+          for(Index k = 0; k < m_active; k++) eps_active(k) = active_eps[k];
+
+          // Curvature from the first derivatives of the orbital
+          // energies, H_kl = d eps_k / d n_l.
+          //
+          // By Janak's theorem this is the same matrix as the second
+          // derivative of the energy, but a first difference of eps
+          // carries an error of order delta/h where a second
+          // difference of the energy carries delta/h^2 -- three
+          // orders better at the probe size used here, on a quantity
+          // whose corruption at the 1e-9 level is what previously
+          // inverted the sign of this curvature. It also costs one
+          // probe per active orbital rather than growing with the
+          // square of their number.
+          //
+          // The probe displaces a single occupation and does not
+          // conserve the particle number: the derivative wanted is
+          // the unconstrained one, and the constraint is imposed by
+          // the border. Orbital energies are read as diagonal
+          // elements in the *reference* pseudo-canonical basis rather
+          // than by re-diagonalising, which keeps the orbital indices
+          // meaning the same thing across probes and costs nothing
+          // beyond the Fock build.
           const Tbase h = kkt_occupation_probe_;
-          auto shifted_energy = [&](const Vector<Tbase> & lambda) {
-            auto trial = occupations;
-            for(Index m = 0; m < ndir; m++) {
-              trial[active[m + 1].first](active[m + 1].second) += lambda(m);
-              trial[active[0].first](active[0].second) -= lambda(m);
+          auto epsilon_at = [&](const OrbitalOccupations<Tbase> & occ,
+                                Vector<Tbase> & out) {
+            initialize_with_orbitals(get_orbitals(), occ);
+            const auto & F = get_fock_matrix();
+            out.resize(m_active);
+            for(Index k = 0; k < m_active; k++) {
+              const size_t b = active[k].first;
+              const size_t i = active[k].second;
+              out(k) = std::real((C_pseudo[b].adjoint() * F[b]
+                                  * C_pseudo[b])(i, i));
             }
-            for(size_t b = 0; b < trial.size(); b++)
-              for(Index k = 0; k < trial[b].size(); k++)
-                trial[b](k) = std::min(maximum_occupation_(b),
-                                       std::max(Tbase(0), trial[b](k)));
-            initialize_with_orbitals(get_orbitals(), trial);
-            return get_energy();
           };
 
-          const Vector<Tbase> zero = Vector<Tbase>::Zero(ndir);
-          const Tbase E0 = shifted_energy(zero);
-          std::vector<Tbase> E_plus(ndir), E_minus(ndir);
-          for(Index m = 0; m < ndir; m++) {
-            Vector<Tbase> lp = zero, lm = zero;
-            lp(m) = h;
-            lm(m) = -h;
-            E_plus[m] = shifted_energy(lp);
-            E_minus[m] = shifted_energy(lm);
-          }
-          Matrix<Tbase> H(ndir, ndir);
-          for(Index m = 0; m < ndir; m++)
-            H(m, m) = (E_plus[m] - Tbase(2) * E0 + E_minus[m]) / (h * h);
-          for(Index m = 0; m < ndir; m++)
-            for(Index n2 = m + 1; n2 < ndir; n2++) {
-              Vector<Tbase> lmn = zero;
-              lmn(m) = h;
-              lmn(n2) = h;
-              const Tbase E_mn = shifted_energy(lmn);
-              const Tbase mixed =
-                (E_mn - E_plus[m] - E_plus[n2] + E0) / (h * h);
-              H(m, n2) = mixed;
-              H(n2, m) = mixed;
+          SecantRecord & memory = secant[iparticle];
+          const bool same_active = memory.has_curvature
+                                   && memory.active == active;
+          Matrix<Tbase> H;
+          if(same_active) {
+            // Carry the curvature and correct it with what the last
+            // step actually did. Re-probing here would throw that
+            // information away and pay |A|+1 Fock builds to recover
+            // the fixed-orbital answer we already know is the wrong
+            // one.
+            H = memory.H;
+            if(memory.has_pair) {
+              const Vector<Tbase> y = eps_active - memory.eps_previous;
+              const Vector<Tbase> & sstep = memory.step_previous;
+              const Vector<Tbase> residual = y - H * sstep;
+              const Tbase denominator = residual.dot(sstep);
+              // The usual safeguard: the rank-one update is unbounded
+              // where the pair says nothing about the curvature along
+              // the step, and applying it there is worse than keeping
+              // the stale value.
+              if(std::abs(denominator)
+                   > Tbase(1e-8) * sstep.norm() * residual.norm()) {
+                H += (residual * residual.transpose()) / denominator;
+                log_(5, "KKT refinement: particle %i curvature updated on the"
+                        " secant pair, diagonal now %e (was %e).\n",
+                     (int) iparticle, (double) H(0, 0),
+                     (double) memory.H(0, 0));
+              }
             }
-          initialize_with_orbitals(state_before.first, state_before.second);
-
-          // Shift the curvature onto the positive cone: a Newton step
-          // on an indefinite model walks uphill.
-          Eigen::SelfAdjointEigenSolver<Matrix<Tbase>> es(H);
-          if(es.info() != Eigen::Success) continue;
-          Vector<Tbase> ev = es.eigenvalues();
-          const Tbase floor_value =
-            std::max(kkt_occupation_threshold_.get(),
-                     Tbase(1e-3) * ev.cwiseAbs().maxCoeff());
-          for(Index m = 0; m < ndir; m++) ev(m) = std::max(ev(m), floor_value);
-          const Matrix<Tbase> H_shifted =
-            es.eigenvectors() * ev.asDiagonal() * es.eigenvectors().transpose();
-
-          const Vector<Tbase> step = H_shifted.ldlt().solve(-g);
-          if(!step.allFinite()) continue;
-
-          // Scale the step back to the feasible box rather than
-          // discarding it. The Newton direction is computed from a
-          // curvature that can be small, so it routinely overshoots a
-          // bound -- and an occupation reaching a bound is the active
-          // set telling us that orbital wants to pin, not a reason to
-          // stand still. Walk as far along the direction as the bounds
-          // allow.
-          Tbase alpha = 1;
-          for(Index m = 0; m < ndir; m++) {
-            const auto & to = active[m + 1];
-            const auto & from = active[0];
-            const Tbase n_to = occupations[to.first](to.second);
-            const Tbase n_from = occupations[from.first](from.second);
-            const Tbase d_to = step(m), d_from = -step(m);
-            if(d_to > 0)
-              alpha = std::min(alpha,
-                               (maximum_occupation_(to.first) - n_to) / d_to);
-            else if(d_to < 0)
-              alpha = std::min(alpha, -n_to / d_to);
-            if(d_from > 0)
-              alpha = std::min(alpha,
-                               (maximum_occupation_(from.first) - n_from)
-                                 / d_from);
-            else if(d_from < 0)
-              alpha = std::min(alpha, -n_from / d_from);
+          } else {
+            Vector<Tbase> eps_reference;
+            epsilon_at(occupations, eps_reference);
+            H.resize(m_active, m_active);
+            bool curvature_ok = true;
+            for(Index l = 0; l < m_active && curvature_ok; l++) {
+              auto probe = occupations;
+              probe[active[l].first](active[l].second) += h;
+              Vector<Tbase> eps_probe;
+              epsilon_at(probe, eps_probe);
+              H.col(l) = (eps_probe - eps_reference) / h;
+              if(!H.col(l).allFinite()) curvature_ok = false;
+            }
+            initialize_with_orbitals(state_before.first, state_before.second);
+            if(!curvature_ok) continue;
+            H = ((H + H.transpose()) / Tbase(2)).eval();
           }
-          // Stop just short of the bound so the orbital stays in the
-          // active set rather than pinning on a rounding error.
-          alpha *= Tbase(0.99);
-          // And no further than the trust radius, the curvature above
-          // being too noisy to be trusted with the step length.
-          const Tbase longest = step.cwiseAbs().maxCoeff();
-          if(longest > 0 && alpha * longest > trust)
-            alpha = trust / longest;
-          if(!(alpha > 0) || !std::isfinite((double) alpha)) {
-            log_(5, "KKT refinement: particle %i has no feasible step.\n",
-                 (int) iparticle);
-            continue;
+          memory.active = active;
+          memory.H = H;
+          memory.has_curvature = true;
+          memory.eps_previous = eps_active;
+          memory.has_pair = false;
+
+          // Walk the active set. Solving the bordered system gives the
+          // step to the point where the active orbitals share a
+          // chemical potential; if that step drives an occupation past
+          // zero or past its maximum, the model is telling us that
+          // orbital belongs at the bound. Take the step as far as the
+          // bound, pin the orbital there, and solve again over what is
+          // left -- the standard primal active-set walk, which
+          // terminates in at most one pass per active orbital.
+          //
+          // Scaling the whole step back instead, and stopping just
+          // short so that nothing ever quite pins, is what this
+          // replaces. That kept an orbital the model wanted empty in
+          // the active set indefinitely, and left the walk to creep
+          // toward a bound it was never allowed to reach.
+          std::vector<bool> pinned(m_active, false);
+          Vector<Tbase> dn = Vector<Tbase>::Zero(m_active);
+          Vector<Tbase> eps_model = eps_active;
+          Tbase mu_solved = 0;
+          bool have_step = false;
+          for(Index round = 0; round < m_active; round++) {
+            std::vector<Index> free_idx;
+            for(Index k = 0; k < m_active; k++)
+              if(!pinned[k]) free_idx.push_back(k);
+            const Index nf = (Index) free_idx.size();
+            if(nf < 2) break;
+
+            // [ H  -1 ] [ dn ]   [ -eps ]
+            // [ 1^T 0 ] [ mu ] = [   0  ]
+            Matrix<Tbase> system = Matrix<Tbase>::Zero(nf + 1, nf + 1);
+            Vector<Tbase> rhs = Vector<Tbase>::Zero(nf + 1);
+            for(Index a = 0; a < nf; a++) {
+              for(Index b = 0; b < nf; b++)
+                system(a, b) = H(free_idx[a], free_idx[b]);
+              system(a, nf) = Tbase(-1);
+              system(nf, a) = Tbase(1);
+              rhs(a) = -eps_model(free_idx[a]);
+            }
+            const Vector<Tbase> solution = system.fullPivLu().solve(rhs);
+            if(!solution.allFinite()) break;
+
+            Vector<Tbase> direction = Vector<Tbase>::Zero(m_active);
+            for(Index a = 0; a < nf; a++) direction(free_idx[a]) = solution(a);
+            mu_solved = solution(nf);
+
+            // How far along it before something hits a bound.
+            Tbase alpha = 1;
+            Index blocking = -1;
+            for(Index a = 0; a < nf; a++) {
+              const Index k = free_idx[a];
+              const Tbase n_k = occupations[active[k].first](active[k].second)
+                                + dn(k);
+              const Tbase d_k = direction(k);
+              Tbase limit = std::numeric_limits<Tbase>::infinity();
+              if(d_k > 0)
+                limit = (maximum_occupation_(active[k].first) - n_k) / d_k;
+              else if(d_k < 0)
+                limit = -n_k / d_k;
+              if(limit < alpha) {
+                alpha = std::max(Tbase(0), limit);
+                blocking = k;
+              }
+            }
+
+            dn += alpha * direction;
+            eps_model += alpha * (H * direction);
+            have_step = true;
+            if(blocking < 0) break;
+
+            pinned[blocking] = true;
+            log_(5, "KKT refinement: particle %i pins %s orbital %zu at its"
+                    " %s bound; re-solving over the %i that remain.\n",
+                 (int) iparticle,
+                 block_descriptions_[active[blocking].first].c_str(),
+                 active[blocking].second,
+                 direction(blocking) > 0 ? "upper" : "lower",
+                 (int) (nf - 1));
           }
-          if(alpha < Tbase(1))
-            log_(5, "KKT refinement: particle %i step scaled by %e to stay"
-                    " within the occupation bounds.\n", (int) iparticle,
-                 (double) alpha);
+          if(!have_step || !dn.allFinite()) continue;
+
+          // The trust radius remains as a guard on the model, not on
+          // the bounds: those are now handled exactly above.
+          Tbase scale = 1;
+          const Tbase longest = dn.cwiseAbs().maxCoeff();
+          if(longest > trust) scale = trust / longest;
+          const Tbase step_length = scale * longest;
 
           auto trial = occupations;
-          for(Index m = 0; m < ndir; m++) {
-            trial[active[m + 1].first](active[m + 1].second) += alpha * step(m);
-            trial[active[0].first](active[0].second) -= alpha * step(m);
-          }
+          for(Index k = 0; k < m_active; k++)
+            trial[active[k].first](active[k].second) += scale * dn(k);
           for(size_t b = 0; b < trial.size(); b++)
             for(Index k = 0; k < trial[b].size(); k++)
               trial[b](k) = std::min(maximum_occupation_(b),
@@ -6427,7 +6550,26 @@ namespace OpenOrbitalOptimizer {
           // to be heard and the stationary point is still in doubt,
           // the residual once the point is settled and only its
           // precision is at stake.
-          if(E_after <= E_before && residual_after < residual_before) {
+          // Accept a move that lowers the residual unless it costs
+          // real energy. Uphill within the convergence threshold is
+          // not a cost: the residual is first order in the occupation
+          // step where the energy is second, so near the solution the
+          // energy difference is smaller than the scale the solver
+          // acts on anywhere else, while the residual still carries
+          // thousands of times its own noise. Insisting on a strictly
+          // downhill energy threw away the best step in the run --
+          // the trace shows the residual offered 2.9e-6 -> 3.4e-8,
+          // eighty-five fold, refused over an energy rise of 1e-10.
+          // The budget is spent against where the refinement began,
+          // not against the previous step. A per-step allowance is a
+          // per-step licence to drift: each move stays inside it and
+          // the sum walks off, which cost 3e-7 to 7e-7 on the iron
+          // atoms -- above what the energy tolerance of their own
+          // regression tests permits. Measured cumulatively the
+          // budget bounds the total climb instead, and the steps
+          // worth having cost around 1e-10, four orders inside it.
+          if(residual_after < residual_before
+             && E_after <= entry_energy + minimum_useful_descent_()) {
             // Double on success, quarter on failure. Tying the radius
             // to the length actually taken instead, so that it
             // contracts with the problem, measured worse on both
@@ -6443,6 +6585,20 @@ namespace OpenOrbitalOptimizer {
             trust = grown;
             improved = true;
             any_step = true;
+            // Keep the accepted iterate explicitly. The history is
+            // ordered by energy, so an accepted uphill move is not its
+            // head, and handing back the head would quietly return the
+            // state this step was taken to leave. Right here the
+            // history holds only iterates at these occupations -- the
+            // step reset it -- so its head is this step's relaxed
+            // state and nothing older.
+            accepted_density = std::get<0>(orbital_history_[0]);
+            accepted_fock = std::get<1>(orbital_history_[0]);
+            // The half of the secant pair that the next sweep will
+            // complete, once it has read the orbital energies this
+            // step's relaxation produced.
+            memory.step_previous = scale * dn;
+            memory.has_pair = true;
             log_occupation_iterate_("Occupation refinement", sweep,
                                     E_after - E_before);
           } else {
@@ -6453,7 +6609,16 @@ namespace OpenOrbitalOptimizer {
                  (double) (E_after - E_before), (double) trust,
                  (double) (trust / Tbase(4)));
             initialize_with_orbitals(state_before.first, state_before.second);
-            trust /= Tbase(4);
+            // Shrink below the step just rejected, not by a blind
+            // factor. The Newton step is usually shorter than the
+            // radius, so dividing the radius alone leaves the step
+            // unchanged and the next sweep proposes and rejects
+            // exactly the same one: the trace showed a step repeated
+            // five times over while the radius fell from 5e-3 to
+            // 2e-5, some seventy-five Fock builds spent re-deriving a
+            // verdict already in hand. Anchoring on the step length
+            // guarantees the next proposal differs.
+            trust = std::min(trust, step_length) / Tbase(4);
             any_step = true;   // a shrunk radius is worth another sweep
           }
         }
@@ -6464,10 +6629,18 @@ namespace OpenOrbitalOptimizer {
       // single new entry. add_entry sorts by energy, so the refined
       // state takes its place at the head if it earned it.
       if(improved) {
-        const auto refined_density = std::get<0>(orbital_history_[0]);
-        const auto refined_fock = std::get<1>(orbital_history_[0]);
-        restore_history_(snapshot);
-        add_entry(refined_density, refined_fock);
+        // Hand back the accepted iterate and nothing else. The
+        // history is ordered by energy and the iterate is its head,
+        // so putting the old entries back files an accepted uphill
+        // move behind whichever earlier one it climbed away from --
+        // which then becomes the iterate again, and the refinement
+        // has been undone by its own bookkeeping. On iron that cost
+        // the whole cleanup: the state handed on was a mixture that
+        // no longer satisfied converged(), so the caller refused the
+        // swap and dropped a gain of 7e-7 Eh along with it.
+        orbital_history_.clear();
+        clear_diis_caches_();
+        add_entry(accepted_density, accepted_fock);
       } else {
         restore_history_(snapshot);
       }

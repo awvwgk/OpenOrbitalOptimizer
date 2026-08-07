@@ -27,6 +27,86 @@
       integrals.
 
 #### Enhancements (continued)
+* The KKT occupation refinement solves the stationarity conditions
+  rather than creeping toward them. On the iron atoms it now reaches
+  a Fermi-level residual of 2e-11 to 2e-7 where it used to stop at
+  1e-5 to 1e-6, lands on the reference energy of the M = 5 atom to
+  1e-10 from either of this machine's two kinds of CPU core, and
+  costs 13 to 29 per cent fewer Fock evaluations.
+    - The step is expressed in the occupations with the particle
+      number carried by an explicit multiplier, not as transfers
+      against one chosen active orbital. The chemical potential then
+      comes out of the solve instead of being averaged over the
+      fractional orbitals, and taking an orbital out of the active set
+      is the deletion of a row and a column.
+    - Which is what makes the bound handling expressible: a step that
+      drives an occupation to zero or to its maximum is taken as far
+      as the bound, that orbital is pinned there, and the reduced
+      problem is solved again. The previous code scaled the whole step
+      back and stopped just short, so an orbital the model wanted
+      empty stayed in the active set indefinitely.
+    - The curvature is the derivative of the orbital energies,
+      ``d eps_k / d n_l``, which by Janak's theorem is the same matrix
+      as the second derivative of the energy but is read from a first
+      difference rather than a second -- an error of order delta/h
+      instead of delta/h^2, three orders better at the probe size used
+      here.
+    - And it is corrected between sweeps by a symmetric rank-one
+      update on the secant pair. The probes measure the curvature at
+      fixed orbitals, while every step is judged after the orbitals
+      have relaxed, and relaxation screens it: on the M = 5 atom the
+      fixed-orbital value is four times too stiff, so every Newton
+      step came out four times too short and the residual contracted
+      by a constant 0.758 a sweep -- linear convergence, which ran out
+      of sweeps at 1e-5 instead of arriving. Both halves of the pair
+      are already computed, so the correction is free, and it also
+      retires the per-sweep probes.
+    - The trust radius shrinks below the step it rejected rather than
+      by a blind factor. The Newton step is usually shorter than the
+      radius, so dividing the radius alone left the next sweep
+      proposing and rejecting the identical step: one trace repeated a
+      step five times while the radius fell from 5e-3 to 2e-5, some
+      seventy-five Fock evaluations spent re-deriving a verdict
+      already in hand.
+    - A step is allowed to climb, but only by less than the scale the
+      solver treats as a real energy difference, and the budget is
+      spent against where the refinement began rather than per step.
+      The residual is first order in the occupation step where the
+      energy is second, so near the solution the energy comparison is
+      reading its own noise while the residual still carries thousands
+      of times its own: one trace refused a step offering 2.9e-6 ->
+      3.4e-8, eighty-five fold, over an energy rise of 1e-10.
+    - The accepted iterate is handed back on its own. The history is
+      ordered by energy and the iterate is its head, so an accepted
+      uphill move was filed behind the entry it climbed away from and
+      that entry became the iterate again -- the refinement undone by
+      its own bookkeeping, and with it the whole cleanup, which the
+      caller then refused for costing the convergence criterion.
+    - Settled occupations are an orbital perturbation, so the
+      orbitals are relaxed at them before the result is handed back.
+* ``atomtest`` can carry the whole SCF -- the Fock builder and the
+  solver together -- at a precision chosen on the command line:
+  ``--precision double``, ``longdouble`` or ``quad``. The radial
+  integrals, the orthogonaliser, the core Hamiltonian, the Coulomb
+  build and the quadrature are all templated on the scalar type.
+  Libxc alone stays in double, being a smooth function of a density
+  rounded to double and so contributing a systematic 1e-15 rather
+  than noise.
+    - It exists to separate an algorithm from its arithmetic. In
+      double the Fock builder reproduces its own answer only to about
+      1e-9 -- the two kinds of CPU core in a hybrid processor differ
+      by that much -- while the occupation refinement has to tell
+      iterates apart by 1e-10. Raising the precision says what the
+      algorithm does when nothing is masked, and it said two useful
+      things: the spin-restricted iron atom was indeed blinded, its
+      residual improving by two orders once the noise was lifted,
+      while the M = 5 atom was not, giving the same 1e-5 in double, in
+      long double and in quadruple precision. That pointed at the
+      curvature rather than the arithmetic.
+    - The orthogonaliser has to be templated with the rest. Built from
+      a double overlap matrix it is orthonormal only to double, and
+      that error enters every later matrix element as though it were
+      noise.
 * The occupation curvature used by the KKT refinement is taken from
   the energy at fixed orbitals, not from the energy plus the
   perturbative estimate of the orbital relaxation. Adding the
