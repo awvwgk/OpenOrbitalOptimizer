@@ -27,6 +27,28 @@
       integrals.
 
 #### Enhancements (continued)
+* A stalled SCF stands on the best iterate it computed rather than
+  the one it happened to be holding. The history is ordered by energy
+  and the iterate is its head, but convergence is judged on the
+  gradient, and the two part company exactly where the run stops: the
+  step stalls because the energy has gone flat to the arithmetic, and
+  among iterates whose energies are then indistinguishable the
+  gradients still differ.
+    - A spin-restricted La+ cation with PBE in the AHGBS-7 basis
+      stalled at a head gradient of 1.06e-6 against a threshold of
+      1e-6 -- six per cent short -- while holding an entry at 9.6e-7.
+      It reported that it had not converged, and the driver exited
+      non-zero, over a fraction of a microhartree of energy separating
+      two iterates it had already paid for.
+    - No step is taken and nothing is recomputed: the choice is among
+      entries in hand, and only once the walk has stopped anyway, so a
+      run that still had somewhere to go is unaffected.
+    - The cleanup that follows a stall is now entered whether or not
+      that choice recovered the convergence, with its guard set to
+      whatever is being claimed. Gating it on having failed meant that
+      recovering convergence silently skipped the occupation cleanup,
+      which left the same case reporting success with its occupations
+      unsettled.
 * The KKT occupation refinement solves the stationarity conditions
   rather than creeping toward them. On the iron atoms it now reaches
   a Fermi-level residual of 2e-11 to 2e-7 where it used to stop at

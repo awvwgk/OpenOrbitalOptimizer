@@ -7358,6 +7358,45 @@ namespace OpenOrbitalOptimizer {
             (!allowed.oda || oda_failed) &&
             (!allowed.orbital_rotation() || rotation_failed);
           if(all_failed) {
+            // Before giving up, stand on the best iterate computed
+            // rather than the cheapest one to reach for.
+            //
+            // The history is ordered by energy and the iterate is its
+            // head, but convergence is judged on the gradient, and the
+            // two part company exactly here: the step stalls because
+            // the energy has gone flat to the arithmetic, and among
+            // iterates whose energies are then indistinguishable the
+            // gradients still differ. A spin-restricted La+ cation
+            // with PBE stalls at a head gradient of 1.06e-6 against a
+            // threshold of 1e-6 while holding an entry at 9.6e-7 --
+            // converged, computed, and passed over because it costs a
+            // fraction of a microhartree.
+            //
+            // Choosing among entries already in hand, and only when
+            // the walk has stopped anyway, so nothing that still had
+            // somewhere to go is affected.
+            if(orbital_history_.size() > 1) {
+              size_t best_index = 0;
+              Tbase best_gradient = norm(diis_error_vector(0));
+              for(size_t ihist = 1; ihist < orbital_history_.size(); ihist++) {
+                const Tbase gradient = norm(diis_error_vector(ihist));
+                if(gradient < best_gradient) {
+                  best_gradient = gradient;
+                  best_index = ihist;
+                }
+              }
+              if(best_index != 0) {
+                log_(1, "Stalled at a gradient of %e, but history entry %zu"
+                        " stands at %e; taking that one.\n",
+                     (double) diis_error, best_index, (double) best_gradient);
+                const auto density = std::get<0>(orbital_history_[best_index]);
+                const auto fock = std::get<1>(orbital_history_[best_index]);
+                orbital_history_.clear();
+                clear_diis_caches_();
+                add_entry(density, fock);
+                diis_error = best_gradient;
+              }
+            }
             log_(1, "All allowed SCF methods failed at iteration %i; stopping with DIIS error vector %s norm %e.\n",
                    (int) iteration, error_norm_.get().c_str(), (double) (diis_error));
             stopped_on_stall = true;
@@ -7386,8 +7425,13 @@ namespace OpenOrbitalOptimizer {
       // optimisation outside the SCF's own convergence control -- easily
       // more work than the iterations that were asked for.
       // ``maximum_iterations`` should mean what it says.
-      if(!converged() && stopped_on_stall)
-        aufbau_cleanup_step(allowed, /*must_stay_converged=*/false);
+      // Gated on the stall, not on having failed: standing on the
+      // best-gradient iterate can leave the run converged after all,
+      // and the occupations still want settling either way. The guard
+      // is set to whatever we are now claiming, so an accepted swap
+      // cannot cost a convergence just recovered.
+      if(stopped_on_stall)
+        aufbau_cleanup_step(allowed, /*must_stay_converged=*/converged());
     }
 
     /// Get the SCF solution
