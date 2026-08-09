@@ -608,6 +608,16 @@ namespace OpenOrbitalOptimizer {
         Tbase(0),
         false};
 
+    /// Largest rotation the perturbative relaxation estimate will
+    /// extrapolate over. The estimate is second order, so it is worth
+    /// having only while the step it predicts stays inside the radius
+    /// a quadratic describes; past that it is not a rough answer but a
+    /// wrong one.
+    Setting<Tbase> perturbative_relaxation_max_step_{
+        settings_, "perturbative_relaxation_max_step",
+        "largest predicted rotation the relaxation estimate will trust",
+        Tbase(0.1)};
+
     /// Number of Fock matrix evaluations
     Setting<int> number_of_fock_evaluations_{
         settings_, "number_of_fock_evaluations",
@@ -4382,6 +4392,33 @@ namespace OpenOrbitalOptimizer {
         for(size_t k = 0; k < ctx.n_par; k++)
           step(k) = ctx.g(k)
                     / (initial_level_shift_ + std::max(Tbase(0), ctx.h(k)));
+      }
+
+      // Decline to estimate where the model does not reach.
+      //
+      // This is second order in the rotation, so it is only worth
+      // anything while the step it predicts is small enough for a
+      // quadratic to describe the surface. The callers do not all
+      // respect that: the polytope search asks for an estimate at
+      // skeleton *vertices*, which can sit a hartree above the relaxed
+      // point, and the orbitals there are as far from stationary as
+      // they get in the whole calculation. What comes back is not a
+      // poor estimate but a meaningless one, and it is then differenced
+      // to build a curvature.
+      //
+      // Gating on the predicted step rather than on the gradient is
+      // the direct condition -- a large gradient against a
+      // correspondingly large curvature still gives a short, honest
+      // step -- and returning zero leaves the caller with the
+      // uncorrected energy, which is a quantity it can trust. The
+      // same substitution, made for the occupation curvature, is what
+      // stopped that one coming out with the wrong sign.
+      const Tbase longest = step.cwiseAbs().maxCoeff();
+      if(!(longest <= perturbative_relaxation_max_step_)) {
+        log_(10, "Perturbative relaxation: predicted step %e exceeds %e;"
+                 " declining to estimate.\n", (double) longest,
+             (double) perturbative_relaxation_max_step_.get());
+        return Tbase(0);
       }
 
       const Tbase lowering = Tbase(-0.5) * ctx.g.dot(step);

@@ -27,6 +27,31 @@
       integrals.
 
 #### Enhancements (continued)
+* The perturbative estimate of the orbital relaxation declines to
+  answer where it cannot. It is second order in the rotation, so it
+  is worth something only while the step it predicts stays inside the
+  radius a quadratic describes; new setting
+  ``perturbative_relaxation_max_step`` (default 0.1) is the largest
+  rotation it will extrapolate over, and past that it returns zero and
+  leaves the caller the uncorrected energy.
+    - The polytope search asked it for an estimate at skeleton
+      *vertices*, which sit up to a hartree above the relaxed point and
+      are where the orbitals are furthest from stationary in the whole
+      calculation. What came back was not a rough number but a
+      meaningless one, and it was then differenced to build the
+      curvature the search steps on.
+    - The effect is visible: the refinement walk in
+      ``relaxed_occupation_search_`` had never taken a step on any case
+      in the test suite -- its quadratic programme returned the anchor
+      it was given, so the loop broke on its first pass every time.
+      With the estimate gated it walks, once on a spin-restricted iron
+      atom and through all four of its refinements on a La+ cation.
+    - It buys no accuracy on either: the answers are unchanged to the
+      last digit, the occupation refinement having reached them
+      anyway. It costs iron one Fock evaluation and La+ sixty, the
+      latter being four relaxations the walk now pays for. Whether
+      that walk earns its keep is a separate question, and one that
+      could not be asked while it was not running.
 * A stalled SCF stands on the best iterate it computed rather than
   the one it happened to be holding. The history is ordered by energy
   and the iterate is its head, but convergence is judged on the
