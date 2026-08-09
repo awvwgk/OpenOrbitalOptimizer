@@ -27,6 +27,25 @@
       integrals.
 
 #### Enhancements (continued)
+* The relaxed polytope search no longer walks by default. New setting
+  ``relaxed_occupation_refinements`` (default 0, was effectively 4)
+  says how many times it re-anchors its quadratic model and steps on
+  it.
+    - Measured on iron at M = 0 and M = 5 and on a La+ cation with
+      PBE, the walk changes neither the energy nor the Fermi-level
+      residual in any digit, and costs one, one and sixty Fock
+      evaluations respectively. What settles the occupations is the
+      initial projected sample, which fixes which orbitals are
+      fractional, and the KKT refinement, which fixes where inside
+      them the occupations sit; the walk between them arrives where
+      both ends already are.
+    - The measurement was only possible once the relaxation estimate
+      feeding its curvature was gated: before that the walk never took
+      a step on any case, so there was nothing to compare against.
+    - Kept rather than removed. All three cases have a polytope of one
+      or two dimensions, and a system with several coupled fractional
+      shells may still need it; the setting makes that a discoverable
+      regression rather than a silent one.
 * The perturbative estimate of the orbital relaxation declines to
   answer where it cannot. It is second order in the rotation, so it
   is worth something only while the step it predicts stays inside the

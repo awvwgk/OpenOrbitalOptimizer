@@ -608,6 +608,32 @@ namespace OpenOrbitalOptimizer {
         Tbase(0),
         false};
 
+    /// How many times the relaxed polytope search re-anchors its
+    /// quadratic model and steps on it.
+    ///
+    /// Zero by default, because the walk has been measured and does
+    /// not pay. It did nothing at all until the relaxation estimate
+    /// feeding its curvature was gated -- its quadratic programme
+    /// returned the anchor it was given and the loop broke on the
+    /// first pass -- and once it began walking, the answers did not
+    /// move: iron at M = 0 and M = 5 and a La+ cation with PBE all
+    /// reproduce their energies and their Fermi-level residuals to the
+    /// last digit with the walk switched off, for one, one and sixty
+    /// fewer Fock evaluations. The initial projected sample settles
+    /// which orbitals are fractional and the occupation refinement
+    /// settles where inside them the occupations sit; the walk between
+    /// them re-derives a point both ends already reach.
+    ///
+    /// It is kept rather than removed because all three cases have a
+    /// polytope of one or two dimensions. A system with several
+    /// coupled fractional shells may yet need it, and leaving the
+    /// setting makes that a discoverable regression instead of a
+    /// silent one.
+    Setting<int> relaxed_occupation_refinements_{
+        settings_, "relaxed_occupation_refinements",
+        "refinement steps taken by the relaxed polytope search",
+        0};
+
     /// Largest rotation the perturbative relaxation estimate will
     /// extrapolate over. The estimate is second order, so it is worth
     /// having only while the step it predicts stays inside the radius
@@ -5702,7 +5728,8 @@ namespace OpenOrbitalOptimizer {
       Vector<Tbase> anchor = origin;
       Vector<Tbase> anchor_gradient = gradient;
       Tbase anchor_energy = E_origin;
-      const size_t maximum_refinements = 4;
+      const size_t maximum_refinements =
+        (size_t) std::max(0, relaxed_occupation_refinements_.get());
       for(size_t refinement = 0; refinement < maximum_refinements; refinement++) {
         // Re-expand the model about the anchor: the QP works in
         // absolute lambda, so fold the shift into the linear and
