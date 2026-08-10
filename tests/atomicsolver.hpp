@@ -2,6 +2,7 @@
 #include <Eigen/Dense>
 #include <cassert>
 #include <cmath>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -85,6 +86,8 @@ namespace OpenOrbitalOptimizer {
     private:
       /// STO exponents
       Eigen::VectorXd zeta_;
+      /// Tabulated two-electron integrals, per partner shell.
+      mutable std::map<const void *, Eigen::MatrixXd> coulomb_tables_;
       /// STO principal quantum numbers
       Eigen::VectorXi n_;
 
@@ -181,19 +184,50 @@ namespace OpenOrbitalOptimizer {
         return df;
       }
       /// Evaluate Coulomb matrix
-      Eigen::MatrixXd coulomb(const STOBasis & other, const Eigen::MatrixXd & Pother) const {
-        auto list(basis_function_pairs());
+      /// Two-electron radial integrals for this pair of shells,
+      /// tabulated on first use.
+      ///
+      /// They depend only on the exponents and quantum numbers, so
+      /// they are the same on every Fock build, and evaluating them
+      /// inside the contraction meant recomputing them every time --
+      /// on a lanthanum atom in AHGBS-7 that is 7.7 million tgamma
+      /// calls per build, and a profile put 94 per cent of the whole
+      /// calculation in this function with four fifths of that inside
+      /// the gamma function. Tabulated, the contraction below is a
+      /// matrix-vector product instead.
+      ///
+      /// Keyed on the address of the other basis, which is sound here
+      /// because the bases are built once and outlive every solver
+      /// that uses them.
+      const Eigen::MatrixXd & coulomb_table(const STOBasis & other) const {
+        auto it = coulomb_tables_.find(&other);
+        if(it != coulomb_tables_.end()) return it->second;
 
+        auto list(basis_function_pairs());
+        const Eigen::Index nother = other.zeta_.size();
+        Eigen::MatrixXd R(list.size(), nother*nother);
+        for(size_t p=0;p<list.size();p++) {
+          const size_t i=list[p].first, j=list[p].second;
+          for(Eigen::Index l=0;l<nother;l++)
+            for(Eigen::Index k=0;k<nother;k++)
+              // Column-major flattening, to match Pother.data().
+              R(p, k + l*nother) =
+                Rmnv(n_(i)+n_(j), other.n_(k)+other.n_(l), 0,
+                     zeta_(i)+zeta_(j), other.zeta_(k)+other.zeta_(l));
+        }
+        return coulomb_tables_.emplace(&other, std::move(R)).first->second;
+      }
+
+      Eigen::MatrixXd coulomb(const STOBasis & other, const Eigen::MatrixXd & Pother) const {
+        const Eigen::MatrixXd & R = coulomb_table(other);
+        Eigen::Map<const Eigen::VectorXd> p(Pother.data(), Pother.size());
+        const Eigen::VectorXd contracted = R * p;
+
+        auto list(basis_function_pairs());
         Eigen::MatrixXd J = Eigen::MatrixXd::Zero(zeta_.size(), zeta_.size());
-#pragma omp parallel for
-        for(auto pair: list) {
-          size_t i=pair.first;
-          size_t j=pair.second;
-          double Jij = 0.0;
-          for(Eigen::Index l=0;l<Pother.cols();l++)
-            for(Eigen::Index k=0;k<Pother.rows();k++)
-              Jij += Pother(k,l) * Rmnv(n_(i)+n_(j), other.n_(k)+other.n_(l), 0, zeta_(i)+zeta_(j), other.zeta_(k)+other.zeta_(l));
-          J(i,j) = J(j,i) = Jij;
+        for(size_t idx=0;idx<list.size();idx++) {
+          const size_t i=list[idx].first, j=list[idx].second;
+          J(i,j) = J(j,i) = contracted(idx);
         }
         return J;
       }
@@ -213,6 +247,8 @@ namespace OpenOrbitalOptimizer {
     private:
       /// GTO exponents
       Eigen::VectorXd zeta_;
+      /// Tabulated two-electron integrals, per partner shell.
+      mutable std::map<const void *, Eigen::MatrixXd> coulomb_tables_;
       /// GTO principal quantum numbers
       Eigen::VectorXi n_;
 
@@ -306,19 +342,50 @@ namespace OpenOrbitalOptimizer {
         return df;
       }
       /// Evaluate Coulomb matrix
-      Eigen::MatrixXd coulomb(const GTOBasis & other, const Eigen::MatrixXd & Pother) const {
-        auto list(basis_function_pairs());
+      /// Two-electron radial integrals for this pair of shells,
+      /// tabulated on first use.
+      ///
+      /// They depend only on the exponents and quantum numbers, so
+      /// they are the same on every Fock build, and evaluating them
+      /// inside the contraction meant recomputing them every time --
+      /// on a lanthanum atom in AHGBS-7 that is 7.7 million tgamma
+      /// calls per build, and a profile put 94 per cent of the whole
+      /// calculation in this function with four fifths of that inside
+      /// the gamma function. Tabulated, the contraction below is a
+      /// matrix-vector product instead.
+      ///
+      /// Keyed on the address of the other basis, which is sound here
+      /// because the bases are built once and outlive every solver
+      /// that uses them.
+      const Eigen::MatrixXd & coulomb_table(const GTOBasis & other) const {
+        auto it = coulomb_tables_.find(&other);
+        if(it != coulomb_tables_.end()) return it->second;
 
+        auto list(basis_function_pairs());
+        const Eigen::Index nother = other.zeta_.size();
+        Eigen::MatrixXd R(list.size(), nother*nother);
+        for(size_t p=0;p<list.size();p++) {
+          const size_t i=list[p].first, j=list[p].second;
+          for(Eigen::Index l=0;l<nother;l++)
+            for(Eigen::Index k=0;k<nother;k++)
+              // Column-major flattening, to match Pother.data().
+              R(p, k + l*nother) =
+                Rmnv(n_(i)+n_(j), other.n_(k)+other.n_(l), 0,
+                     zeta_(i)+zeta_(j), other.zeta_(k)+other.zeta_(l));
+        }
+        return coulomb_tables_.emplace(&other, std::move(R)).first->second;
+      }
+
+      Eigen::MatrixXd coulomb(const GTOBasis & other, const Eigen::MatrixXd & Pother) const {
+        const Eigen::MatrixXd & R = coulomb_table(other);
+        Eigen::Map<const Eigen::VectorXd> p(Pother.data(), Pother.size());
+        const Eigen::VectorXd contracted = R * p;
+
+        auto list(basis_function_pairs());
         Eigen::MatrixXd J = Eigen::MatrixXd::Zero(zeta_.size(), zeta_.size());
-#pragma omp parallel for
-        for(auto pair: list) {
-          size_t i=pair.first;
-          size_t j=pair.second;
-          double Jij = 0.0;
-          for(Eigen::Index l=0;l<Pother.cols();l++)
-            for(Eigen::Index k=0;k<Pother.rows();k++)
-              Jij += Pother(k,l) * Rmnv(n_(i)+n_(j), other.n_(k)+other.n_(l), 0, zeta_(i)+zeta_(j), other.zeta_(k)+other.zeta_(l));
-          J(i,j) = J(j,i) = Jij;
+        for(size_t idx=0;idx<list.size();idx++) {
+          const size_t i=list[idx].first, j=list[idx].second;
+          J(i,j) = J(j,i) = contracted(idx);
         }
         return J;
       }
