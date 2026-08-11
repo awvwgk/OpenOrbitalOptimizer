@@ -29,6 +29,25 @@ namespace OpenOrbitalOptimizer {
         return (n-1)/x;
       }
 
+      /// The same closed forms evaluated in an arbitrary scalar type.
+      ///
+      /// These are the radial integrals themselves, not contractions
+      /// with a density, so their precision is a systematic offset
+      /// rather than noise. They are templated all the same: an
+      /// orthonormal basis built from a double overlap matrix is only
+      /// orthonormal to double, and that error does enter every
+      /// subsequent quantity as though it were noise.
+      template<typename T>
+      inline T Vn_t(T n, T x) const {
+        using std::tgamma; using std::pow;
+        return tgamma(n+T(1))/pow(x,n+T(1));
+      }
+
+      template<typename T>
+      inline T Wn_t(int n, T x) const {
+        return T(n-1)/x;
+      }
+
 #if 0
       inline double Enk(int n, int k, double x, int increment=1) const {
         double E=0.0; // E^n_0 = 0
@@ -47,6 +66,30 @@ namespace OpenOrbitalOptimizer {
       inline double binomial(double n, double k) const {
         double binomial = (std::tgamma(n+1.0)/std::tgamma(n-k+1.0))/std::tgamma(k+1.0);
         return binomial;
+      }
+
+      template<typename T>
+      inline T binomial_t(T n, T k) const {
+        using std::tgamma;
+        return (tgamma(n+T(1))/tgamma(n-k+T(1)))/tgamma(k+T(1));
+      }
+
+      template<typename T>
+      inline T Enk_t(T n, T k, T x) const {
+        using std::pow;
+        T E = T(0);
+        for(int j=0;j<(int)k;j++)
+          E += binomial_t<T>(n,T(j))*pow(x,T(j));
+        E /= binomial_t<T>(n,k)*pow(x,k);
+        return E;
+      }
+
+      template<typename T>
+      inline T Enk_int_t(int n, int k, T x) const {
+        T E = T(0);
+        for(int ik=1;ik<=k;ik++)
+          E = T(ik)*(T(1)+E)/(T(n-ik+1)*x);
+        return E;
       }
 
       inline double Enk(double n, double k, double x) const {
@@ -231,6 +274,100 @@ namespace OpenOrbitalOptimizer {
         }
         return J;
       }
+      /// Radial integrals in an arbitrary scalar type.
+      template<typename T>
+      inline T Rmnv_t(int m, int n, int v, T x, T y) const {
+        using std::tgamma; using std::pow;
+        return tgamma(T(m+n))/(x*y*pow(x+y,T(m+n-1)))
+               *(T(1)+Enk_int_t<T>(m+n-1,n-v-1,y/x)+Enk_int_t<T>(m+n-1,m-v-1,x/y));
+      }
+
+    public:
+      template<typename T>
+      Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> overlap_t() const {
+        auto list(basis_function_pairs());
+        Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> S(zeta_.size(), zeta_.size());
+        for(auto pair: list) {
+          size_t i=pair.first, j=pair.second;
+          S(i,j) = S(j,i) = Vn_t<T>(T(n_(i)+n_(j)), T(zeta_(i))+T(zeta_(j)));
+        }
+        return S;
+      }
+      template<typename T>
+      Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> kinetic_t(int am) const {
+        auto list(basis_function_pairs());
+        Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> Tm(zeta_.size(), zeta_.size());
+        for(auto pair: list) {
+          size_t i=pair.first, j=pair.second;
+          const T zi = T(zeta_(i)), zj = T(zeta_(j));
+          Tm(i,j) = Tm(j,i) = T(0.5)*zi*zj*(
+              Wn_t<T>(n_(i)-am, zi) * Wn_t<T>(n_(j)-am, zj) * Vn_t<T>(T(n_(i)+n_(j)-2), zi+zj)
+              - (Wn_t<T>(n_(i)-am, zi) + Wn_t<T>(n_(j)-am, zj)) * Vn_t<T>(T(n_(i)+n_(j)-1), zi+zj)
+              + Vn_t<T>(T(n_(i)+n_(j)), zi+zj));
+        }
+        return Tm;
+      }
+      template<typename T>
+      Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> nuclear_attraction_t() const {
+        auto list(basis_function_pairs());
+        Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> V(zeta_.size(), zeta_.size());
+        for(auto pair: list) {
+          size_t i=pair.first, j=pair.second;
+          V(i,j) = V(j,i) = Vn_t<T>(T(n_(i)+n_(j)-1), T(zeta_(i))+T(zeta_(j)));
+        }
+        return V;
+      }
+      template<typename T>
+      Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>
+      eval_f_t(const Eigen::Matrix<T,Eigen::Dynamic,1> & x) const {
+        using std::pow; using std::exp;
+        Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> f =
+          Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>::Zero(x.size(), zeta_.size());
+        for(Eigen::Index iz=0; iz<zeta_.size(); iz++)
+          for(Eigen::Index ix=0; ix<x.size(); ix++)
+            f(ix,iz) = pow(x(ix),T(n_(iz)-1)) * exp(-T(zeta_(iz))*x(ix));
+        return f;
+      }
+      template<typename T>
+      Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>
+      eval_df_t(const Eigen::Matrix<T,Eigen::Dynamic,1> & x) const {
+        using std::pow; using std::exp;
+        Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> df =
+          Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>::Zero(x.size(), zeta_.size());
+        for(Eigen::Index iz=0; iz<zeta_.size(); iz++)
+          for(Eigen::Index ix=0; ix<x.size(); ix++) {
+            df(ix,iz) = -T(zeta_(iz)) * pow(x(ix),T(n_(iz)-1)) * exp(-T(zeta_(iz))*x(ix));
+            if(n_(iz)>1)
+              df(ix,iz) += T(n_(iz)-1) * pow(x(ix),T(n_(iz)-2)) * exp(-T(zeta_(iz))*x(ix));
+          }
+        return df;
+      }
+      /// Coulomb contraction accumulated in an arbitrary scalar type.
+      ///
+      /// The radial integrals stay in double: they depend only on the
+      /// basis, so their error is a fixed offset that cancels out of
+      /// energy differences. The contraction against the density does
+      /// not -- it is summed afresh at every occupation the solver
+      /// tries, and it is differences between those that the
+      /// occupation refinement has to resolve.
+      template<typename T>
+      Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>
+      coulomb_scalar(const STOBasis & other,
+                     const Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> & Pother) const {
+        auto list(basis_function_pairs());
+        Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> J =
+          Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>::Zero(zeta_.size(), zeta_.size());
+        for(auto pair: list) {
+          size_t i=pair.first;
+          size_t j=pair.second;
+          T Jij = T(0);
+          for(Eigen::Index l=0;l<Pother.cols();l++)
+            for(Eigen::Index k=0;k<Pother.rows();k++)
+              Jij += Pother(k,l) * Rmnv_t<T>(n_(i)+n_(j), other.n_(k)+other.n_(l), 0, T(zeta_(i))+T(zeta_(j)), T(other.zeta_(k))+T(other.zeta_(l)));
+          J(i,j) = J(j,i) = Jij;
+        }
+        return J;
+      }
       /// Wrapper for the above
       Eigen::MatrixXd coulomb(const std::shared_ptr<const RadialBasis> & other, const Eigen::MatrixXd & Pother) const override {
         assert(other->get_type() == STOBASIS);
@@ -386,6 +523,101 @@ namespace OpenOrbitalOptimizer {
         for(size_t idx=0;idx<list.size();idx++) {
           const size_t i=list[idx].first, j=list[idx].second;
           J(i,j) = J(j,i) = contracted(idx);
+        }
+        return J;
+      }
+      /// Radial integrals in an arbitrary scalar type.
+      template<typename T>
+      inline T Rmnv_t(int m, int n, int v, T x, T y) const {
+        using std::tgamma; using std::pow;
+        return tgamma(T(m+n-1)/T(2))/(x*y*pow(x+y,T(m+n-3)/T(2)))
+               *(T(1)+Enk_t<T>(T(m+n-3)/T(2),T(n-v-2)/T(2),y/x)
+                    +Enk_t<T>(T(m+n-3)/T(2),T(m-v-2)/T(2),x/y))/T(4);
+      }
+
+    public:
+      template<typename T>
+      Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> overlap_t() const {
+        auto list(basis_function_pairs());
+        Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> S(zeta_.size(), zeta_.size());
+        for(auto pair: list) {
+          size_t i=pair.first, j=pair.second;
+          S(i,j) = S(j,i) = T(0.5)*Vn_t<T>(T(n_(i)+n_(j)-1)/T(2), T(zeta_(i))+T(zeta_(j)));
+        }
+        return S;
+      }
+      template<typename T>
+      Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> kinetic_t(int am) const {
+        auto list(basis_function_pairs());
+        Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> Tm(zeta_.size(), zeta_.size());
+        for(auto pair: list) {
+          size_t i=pair.first, j=pair.second;
+          const T zi = T(zeta_(i)), zj = T(zeta_(j));
+          Tm(i,j) = Tm(j,i) = zi*zj*(
+              Wn_t<T>(n_(i)-am, T(2)*zi) * Wn_t<T>(n_(j)-am, T(2)*zj) * Vn_t<T>(T(n_(i)+n_(j)-3)/T(2), zi+zj)
+              - (Wn_t<T>(n_(i)-am, T(2)*zi) + Wn_t<T>(n_(j)-am, T(2)*zj)) * Vn_t<T>(T(n_(i)+n_(j)-1)/T(2), zi+zj)
+              + Vn_t<T>(T(n_(i)+n_(j)+1)/T(2), zi+zj));
+        }
+        return Tm;
+      }
+      template<typename T>
+      Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> nuclear_attraction_t() const {
+        auto list(basis_function_pairs());
+        Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> V(zeta_.size(), zeta_.size());
+        for(auto pair: list) {
+          size_t i=pair.first, j=pair.second;
+          V(i,j) = V(j,i) = T(0.5)*Vn_t<T>(T(n_(i)+n_(j)-2)/T(2), T(zeta_(i))+T(zeta_(j)));
+        }
+        return V;
+      }
+      template<typename T>
+      Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>
+      eval_f_t(const Eigen::Matrix<T,Eigen::Dynamic,1> & x) const {
+        using std::pow; using std::exp;
+        Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> f =
+          Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>::Zero(x.size(), zeta_.size());
+        for(Eigen::Index iz=0; iz<zeta_.size(); iz++)
+          for(Eigen::Index ix=0; ix<x.size(); ix++)
+            f(ix,iz) = pow(x(ix),T(n_(iz)-1)) * exp(-T(zeta_(iz))*x(ix)*x(ix));
+        return f;
+      }
+      template<typename T>
+      Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>
+      eval_df_t(const Eigen::Matrix<T,Eigen::Dynamic,1> & x) const {
+        using std::pow; using std::exp;
+        Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> df =
+          Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>::Zero(x.size(), zeta_.size());
+        for(Eigen::Index iz=0; iz<zeta_.size(); iz++)
+          for(Eigen::Index ix=0; ix<x.size(); ix++) {
+            df(ix,iz) = -T(2)*T(zeta_(iz)) * x(ix) * pow(x(ix),T(n_(iz)-1)) * exp(-T(zeta_(iz))*x(ix)*x(ix));
+            if(n_(iz)>1)
+              df(ix,iz) += T(n_(iz)-1) * pow(x(ix),T(n_(iz)-2)) * exp(-T(zeta_(iz))*x(ix)*x(ix));
+          }
+        return df;
+      }
+      /// Coulomb contraction accumulated in an arbitrary scalar type.
+      ///
+      /// The radial integrals stay in double: they depend only on the
+      /// basis, so their error is a fixed offset that cancels out of
+      /// energy differences. The contraction against the density does
+      /// not -- it is summed afresh at every occupation the solver
+      /// tries, and it is differences between those that the
+      /// occupation refinement has to resolve.
+      template<typename T>
+      Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>
+      coulomb_scalar(const GTOBasis & other,
+                     const Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> & Pother) const {
+        auto list(basis_function_pairs());
+        Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic> J =
+          Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>::Zero(zeta_.size(), zeta_.size());
+        for(auto pair: list) {
+          size_t i=pair.first;
+          size_t j=pair.second;
+          T Jij = T(0);
+          for(Eigen::Index l=0;l<Pother.cols();l++)
+            for(Eigen::Index k=0;k<Pother.rows();k++)
+              Jij += Pother(k,l) * Rmnv_t<T>(n_(i)+n_(j), other.n_(k)+other.n_(l), 0, T(zeta_(i))+T(zeta_(j)), T(other.zeta_(k))+T(other.zeta_(l)));
+          J(i,j) = J(j,i) = Jij;
         }
         return J;
       }

@@ -27,15 +27,50 @@ set_tests_properties(
 # On Windows, the run1/run2 tests give `Exit code 0xc0000374` = STATUS_HEAP_CORRUPTION with MinGW (Gnu) compilers. Use clang-cl instead.
 add_test(  # Test #2
   NAME openorbopt/atomtest/run1
-  COMMAND $<TARGET_FILE:openorbopt-atomtest> --Z 8 --xfunc GGA_X_PBE --cfunc GGA_C_PBE --M 1 --basis "${CMAKE_CURRENT_SOURCE_DIR}/cc-pvdz.json"
+  COMMAND $<TARGET_FILE:openorbopt-atomtest> --Z 8 --xfunc GGA_X_PBE --cfunc GGA_C_PBE --M 1 --basis "${CMAKE_CURRENT_SOURCE_DIR}/cc-pvdz.json" --reference-energy -74.9164866611 --energy-tolerance 1e-8
   )
 add_test(  # Test #3
   NAME openorbopt/atomtest/run2
-  COMMAND $<TARGET_FILE:openorbopt-atomtest> --Z 8 --xfunc GGA_X_PBE --cfunc GGA_C_PBE --M 3 --basis "${CMAKE_CURRENT_SOURCE_DIR}/cc-pvdz.json"
+  COMMAND $<TARGET_FILE:openorbopt-atomtest> --Z 8 --xfunc GGA_X_PBE --cfunc GGA_C_PBE --M 3 --basis "${CMAKE_CURRENT_SOURCE_DIR}/cc-pvdz.json" --reference-energy -74.9722875549 --energy-tolerance 1e-8
+  )
+# Transition metals. These are the cases where the occupations of a
+# fractionally filled shell are free to settle anywhere along a very
+# flat valley -- iron shares its valence between 4s and 3d -- and
+# before the occupations were held to their stationarity conditions
+# the same command reproducibly gave two different answers 2e-6 Eh
+# apart, both reporting convergence. There was nothing stable to
+# assert until then, which is why they are only now in CI.
+#
+# They are run without DIIS. The extrapolation converges these cases
+# on its own and the orbital-rotation step barely runs, so a mix
+# containing it would not exercise what these tests are here for.
+#
+# Each takes three to five minutes, comparable to the instantiation
+# builds below.
+add_test(  # Test #4
+  NAME openorbopt/atomtest/iron-unrestricted
+  COMMAND $<TARGET_FILE:openorbopt-atomtest> --Z 26 --M 5 --xfunc GGA_X_PBE --cfunc GGA_C_PBE --basis "${CMAKE_CURRENT_SOURCE_DIR}/cc-pvdz.json" --methods "ODA + ARH" --reference-energy -1263.4350147950 --energy-tolerance 1e-7 --max-fermi-level-error 1e-5
+  )
+# The restricted atom is held to a looser gradient than the default
+# and a tighter Fermi-level residual, which is the trade this case
+# actually offers. Settling its occupations perturbs the orbitals, and
+# winning that back is worth about g^2/2H in energy -- some 1e-12 at
+# the gradient reached here, three orders under what the Fock builder
+# reproduces. So the last factor of two in the gradient cannot be paid
+# for by any step a line search can verify, and demanding it would
+# only mean reporting the unsettled occupations instead: this case
+# used to pass with a Fermi-level error of 0.13. Asking for 2e-6 in
+# the gradient and 1e-5 in the residual asks for what is reachable,
+# and for the physics the test exists to check.
+add_test(  # Test #5
+  NAME openorbopt/atomtest/iron-restricted
+  COMMAND $<TARGET_FILE:openorbopt-atomtest> --Z 26 --M 0 --xfunc GGA_X_PBE --cfunc GGA_C_PBE --basis "${CMAKE_CURRENT_SOURCE_DIR}/cc-pvdz.json" --methods "ODA + ARH" --convthr 2e-6 --reference-energy -1263.3342431303 --energy-tolerance 1e-6 --max-fermi-level-error 1e-5
   )
 set_tests_properties(
   openorbopt/atomtest/run1
   openorbopt/atomtest/run2
+  openorbopt/atomtest/iron-unrestricted
+  openorbopt/atomtest/iron-restricted
   PROPERTIES
     FIXTURES_REQUIRED OPENORBOPT_ATOMTEST_EXEC
   )
@@ -71,6 +106,23 @@ set_tests_properties(
   add_test(
     NAME openorbopt/degenerate-occupations
     COMMAND $<TARGET_FILE:openorbopt-degenerate-occupations>
+  )
+
+  # Conventions of the ARH curvature pairs, checked against
+  # numerically differentiated gradients on a model whose two particle
+  # types are coupled.
+  add_executable(
+    openorbopt-arh-hessian
+    arh_hessian.cpp
+  )
+  target_link_libraries(
+    openorbopt-arh-hessian
+    PRIVATE
+    ${ooo}::OpenOrbitalOptimizer
+  )
+  add_test(
+    NAME openorbopt/arh-hessian
+    COMMAND $<TARGET_FILE:openorbopt-arh-hessian>
   )
 
   # Instantiations of SCFSolver<Tbase, IsComplex> for

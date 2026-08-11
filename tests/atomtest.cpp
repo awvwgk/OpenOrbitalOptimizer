@@ -11,6 +11,51 @@
 #include <nlohmann/json.hpp>
 #include "cmdline.h"
 
+
+namespace {
+  /// Extra solver settings requested on the command line as
+  /// ``--set key=value,key=value``. Held in a global rather than
+  /// threaded through every driver signature: this is a test driver,
+  /// and the alternative is the same parameter on six functions.
+  std::string g_settings_override;
+
+  /// Apply those settings, dispatching on the type the solver's own
+  /// catalog reports for each key. Unknown keys and malformed pairs
+  /// throw, so a typo in a benchmark sweep fails loudly instead of
+  /// silently measuring the default.
+  template<typename Solver>
+  void apply_settings_override(Solver & solver) {
+    if(g_settings_override.empty()) return;
+    std::string spec = g_settings_override;
+    size_t pos = 0;
+    while(pos <= spec.size()) {
+      size_t comma = spec.find(',', pos);
+      if(comma == std::string::npos) comma = spec.size();
+      std::string item = spec.substr(pos, comma - pos);
+      pos = comma + 1;
+      if(item.empty()) continue;
+      size_t eq = item.find('=');
+      if(eq == std::string::npos)
+        throw std::runtime_error("--set expects key=value, got '" + item + "'");
+      std::string key = item.substr(0, eq);
+      std::string value = item.substr(eq + 1);
+      const char * type = nullptr;
+      for(const auto & option : Solver::options())
+        if(key == option.key) { type = option.type; break; }
+      if(!type)
+        throw std::runtime_error("--set: unknown setting '" + key + "'");
+      if(std::string(type) == "real")
+        solver.set(key, (typename std::decay<decltype(solver.get_real(key))>::type)
+                          std::stod(value));
+      else if(std::string(type) == "int")
+        solver.set(key, std::stoi(value));
+      else
+        solver.set(key, value);
+      std::printf("Setting override: %s = %s\n", key.c_str(), value.c_str());
+    }
+  }
+}
+
 namespace OpenOrbitalOptimizer {
   // Instantiate all types of SCFSolver just to check it compiles
   template class SCFSolver<double, double>;
@@ -436,6 +481,210 @@ namespace OpenOrbitalOptimizer {
       return J;
     }
 
+    /// Dispatch the templated radial integrals past the virtual
+    /// interface, which cannot itself be a template.
+    template<typename T, typename F>
+    auto on_basis(const std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasis> & b, F && f)
+      -> decltype(f(*std::dynamic_pointer_cast<const OpenOrbitalOptimizer::AtomicSolver::GTOBasis>(b))) {
+      if(b->get_type() == OpenOrbitalOptimizer::AtomicSolver::GTOBASIS)
+        return f(*std::dynamic_pointer_cast<const OpenOrbitalOptimizer::AtomicSolver::GTOBasis>(b));
+      return f(*std::dynamic_pointer_cast<const OpenOrbitalOptimizer::AtomicSolver::STOBasis>(b));
+    }
+
+    /// Canonical orthogonalisation carried at the target precision.
+    ///
+    /// Done in double, X is orthonormal only to double, and that error
+    /// propagates into every matrix element as though it were noise --
+    /// which defeats raising the precision of everything downstream.
+    template<typename T>
+    std::vector<Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>>
+    form_X_at(double linear_dependency_threshold,
+              const std::vector<std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasis>> & radial_basis) {
+      using Mat = Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>;
+      using Vec = Eigen::Matrix<T,Eigen::Dynamic,1>;
+      using std::pow;
+      std::vector<Mat> X(radial_basis.size());
+      for(size_t i=0;i<X.size();i++) {
+        Mat S = on_basis<T>(radial_basis[i], [](const auto & b){ return b.template overlap_t<T>(); });
+        Vec normlz(S.rows());
+        for(Eigen::Index k=0;k<S.rows();k++) normlz(k) = pow(S(k,k), T(-0.5));
+        Mat Snorm = normlz.asDiagonal() * S * normlz.asDiagonal();
+
+        Eigen::SelfAdjointEigenSolver<Mat> es(Snorm);
+        Vec sval = es.eigenvalues();
+        Mat svec = es.eigenvectors();
+
+        std::vector<Eigen::Index> sidx;
+        for(Eigen::Index k=0;k<sval.size();k++)
+          if(sval(k) >= T(linear_dependency_threshold))
+            sidx.push_back(k);
+
+        Mat Xi(svec.rows(), sidx.size());
+        Vec scale(sidx.size());
+        for(size_t k=0;k<sidx.size();k++) {
+          Xi.col(k) = svec.col(sidx[k]);
+          scale(k)  = pow(sval(sidx[k]), T(-0.5));
+        }
+        X[i] = Xi * scale.asDiagonal();
+        X[i] = normlz.asDiagonal() * X[i];
+      }
+      return X;
+    }
+
+    /// Core Hamiltonian at the target precision.
+    template<typename T>
+    std::vector<std::pair<Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>,
+                          Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>>>
+    form_core_hamiltonian_at(const std::vector<std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasis>> & radial_basis,
+                             double Z, double particle_mass = 1.0) {
+      using Mat = Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>;
+      std::vector<std::pair<Mat,Mat>> Hcore(radial_basis.size());
+      for(size_t i=0;i<radial_basis.size();i++) {
+        Mat Tm = on_basis<T>(radial_basis[i], [i](const auto & b){ return b.template kinetic_t<T>((int) i); }) / T(particle_mass);
+        Mat V = -T(Z)*on_basis<T>(radial_basis[i], [](const auto & b){ return b.template nuclear_attraction_t<T>(); });
+        Hcore[i] = std::make_pair(Tm,V);
+      }
+      return Hcore;
+    }
+
+    /// Coulomb build at an arbitrary accumulation precision.
+    ///
+    /// Dispatches on the basis type because a virtual function cannot
+    /// be a template; the contraction itself lives on the basis.
+    template<typename T>
+    std::vector<Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>>
+    build_J_scalar(const std::vector<std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasis>> & basis,
+                   const std::vector<std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasis>> & Pbasis,
+                   const std::vector<Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>> & P) {
+      using Mat = Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>;
+      std::vector<Mat> J(basis.size());
+      for(size_t i=0;i<basis.size();i++)
+        J[i] = Mat::Zero(basis[i]->nbf(),basis[i]->nbf());
+
+      for(size_t lin=0;lin<Pbasis.size();lin++) {
+        if(P[lin].norm() == T(0))
+          continue;
+        for(size_t lout=0;lout<basis.size();lout++) {
+          if(basis[lout]->get_type() == OpenOrbitalOptimizer::AtomicSolver::GTOBASIS) {
+            auto out = std::dynamic_pointer_cast<const OpenOrbitalOptimizer::AtomicSolver::GTOBasis>(basis[lout]);
+            auto in  = std::dynamic_pointer_cast<const OpenOrbitalOptimizer::AtomicSolver::GTOBasis>(Pbasis[lin]);
+            J[lout] += out->template coulomb_scalar<T>(*in, P[lin]);
+          } else {
+            auto out = std::dynamic_pointer_cast<const OpenOrbitalOptimizer::AtomicSolver::STOBasis>(basis[lout]);
+            auto in  = std::dynamic_pointer_cast<const OpenOrbitalOptimizer::AtomicSolver::STOBasis>(Pbasis[lin]);
+            J[lout] += out->template coulomb_scalar<T>(*in, P[lin]);
+          }
+        }
+      }
+      return J;
+    }
+
+    /// Exchange-correlation build at an arbitrary accumulation
+    /// precision.
+    ///
+    /// libxc is called in double, on a density rounded to double. It
+    /// is a smooth function of that density, so what it contributes
+    /// is a systematic error of order 1e-16 relative -- some 1e-15 Eh
+    /// on an atom of this size, four orders below the differences the
+    /// occupation refinement has to resolve. The quadrature sum is
+    /// what has to be carried at higher precision: it adds some 1e5
+    /// contributions, and doing that in double loses the last 1e-9 of
+    /// a total of a thousand hartree.
+    template<typename T>
+    std::tuple<T,std::vector<Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>>>
+    build_xc_unpolarized_scalar(const std::vector<std::shared_ptr<const RadialBasis>> & basis,
+                                const std::vector<Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>> & P,
+                                size_t N, int func_id) {
+      using Mat = Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>;
+      using Vec = Eigen::Matrix<T,Eigen::Dynamic,1>;
+      assert(basis.size() == P.size());
+
+      if(func_id<=0) {
+        std::vector<Mat> F(basis.size());
+        for(size_t l=0;l<basis.size();l++)
+          F[l] = Mat::Zero(basis[l]->nbf(),basis[l]->nbf());
+        return std::make_tuple(T(0),F);
+      }
+
+      IntegratorXX::TreutlerAhlrichs<double,double> quad(N);
+      const auto & quad_w = quad.weights();
+      const auto & quad_r = quad.points();
+      Eigen::VectorXd wd = Eigen::Map<const Eigen::VectorXd>(quad_w.data(), quad_w.size());
+      Eigen::VectorXd rd = Eigen::Map<const Eigen::VectorXd>(quad_r.data(), quad_r.size());
+      const T angfac = T(4)*T(M_PI);
+
+      // Grid and basis values are fixed data; promoting them once
+      // keeps every contraction below in T.
+      std::vector<Mat> bf(basis.size()), df(basis.size());
+      for(size_t l=0;l<basis.size();l++) {
+        const Eigen::Matrix<T,Eigen::Dynamic,1> rT = rd.template cast<T>();
+        bf[l]=on_basis<T>(basis[l], [&rT](const auto & b){ return b.template eval_f_t<T>(rT); });
+        df[l]=on_basis<T>(basis[l], [&rT](const auto & b){ return b.template eval_df_t<T>(rT); });
+      }
+      const Vec w = wd.template cast<T>();
+      const Vec r = rd.template cast<T>();
+
+      Vec rho = Vec::Zero(r.size());
+      for(size_t l=0;l<basis.size();l++)
+        rho += (bf[l]*P[l]/angfac*bf[l].transpose()).diagonal();
+
+      Vec drho = Vec::Zero(r.size());
+      for(size_t l=0;l<basis.size();l++)
+        drho += T(2)*(df[l]*P[l]/angfac*bf[l].transpose()).diagonal();
+      Vec sigma_v = drho.array().square().matrix();
+
+      Vec tau_v = Vec::Zero(r.size());
+      for(size_t l=0;l<basis.size();l++)
+        tau_v += T(0.5)*(df[l]*P[l]/angfac*df[l].transpose()).diagonal();
+      for(size_t l=1;l<basis.size();l++)
+        tau_v.array() += T(0.5)*T(l)*T(l+1)*(bf[l]*P[l]/angfac*bf[l].transpose()).diagonal().array() / r.array().square();
+
+      // Down to double for libxc, and straight back.
+      Eigen::MatrixXd rho_d = rho.template cast<double>();
+      Eigen::MatrixXd sigma_d = sigma_v.template cast<double>();
+      Eigen::MatrixXd tau_d = tau_v.template cast<double>();
+      Eigen::VectorXd exc_d;
+      Eigen::MatrixXd vxc_d, vsigma_d, vtau_d;
+      auto ggamgga = eval_xc(rho_d, sigma_d, tau_d, exc_d, vxc_d, vsigma_d, vtau_d, func_id, XC_UNPOLARIZED);
+      const bool gga = std::get<0>(ggamgga);
+      const bool mgga = std::get<1>(ggamgga);
+      const Vec exc = exc_d.template cast<T>();
+      const Vec vxc = vxc_d.col(0).template cast<T>();
+
+      T E = T(0);
+      for(Eigen::Index ig=0; ig<r.size(); ig++)
+        E += exc(ig) * rho(ig) * w(ig) * r(ig) * r(ig);
+      E *= angfac;
+
+      const Vec r2 = r.array().square().matrix();
+      const Vec w_r2 = (w.array()*r2.array()).matrix();
+      std::vector<Mat> F(basis.size());
+      for(size_t l=0;l<basis.size();l++) {
+        Vec d = (w_r2.array()*vxc.array()).matrix();
+        F[l] = bf[l].transpose() * d.asDiagonal() * bf[l];
+      }
+      if(gga) {
+        const Vec vsigma = vsigma_d.col(0).template cast<T>();
+        for(size_t l=0;l<basis.size();l++) {
+          Vec d = (w_r2.array() * vsigma.array() * drho.array()).matrix();
+          Mat Fgga = T(2)*df[l].transpose() * d.asDiagonal() * bf[l];
+          F[l] += Fgga + Fgga.transpose();
+        }
+      }
+      if(mgga) {
+        const Vec vtau = vtau_d.col(0).template cast<T>();
+        for(size_t l=0;l<basis.size();l++) {
+          Vec d = (w_r2.array() * vtau.array()).matrix();
+          F[l] += T(0.5)*df[l].transpose() * d.asDiagonal() * df[l];
+          if(l>0) {
+            Vec d2 = (w.array() * vtau.array()).matrix();
+            F[l] += T(0.5)*T(l)*T(l+1)*bf[l].transpose() * d2.asDiagonal() * bf[l];
+          }
+        }
+      }
+      return std::make_tuple(E,F);
+    }
+
     std::vector<Eigen::MatrixXd> form_X(double linear_dependency_threshold, const std::vector<std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasis>> & radial_basis) {
       std::vector<Eigen::MatrixXd> X(radial_basis.size());
       for(size_t i=0;i<X.size();i++) {
@@ -488,6 +737,227 @@ namespace OpenOrbitalOptimizer {
         E += 0.5*(J[l]*P[l]).trace();
       }
       return E;
+    }
+
+    /// Spin-polarised exchange-correlation build at an arbitrary
+    /// accumulation precision. Same division of labour as the
+    /// unpolarised form: fixed data and libxc in double, everything
+    /// that touches the density in T.
+    template<typename T>
+    std::tuple<T,std::vector<Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>>,
+               std::vector<Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>>>
+    build_xc_polarized_scalar(const std::vector<std::shared_ptr<const RadialBasis>> & basis,
+                              const std::vector<Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>> & Pa,
+                              const std::vector<Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>> & Pb,
+                              size_t N, int func_id) {
+      using Mat = Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>;
+      using Vec = Eigen::Matrix<T,Eigen::Dynamic,1>;
+      assert(basis.size() == Pa.size());
+      assert(basis.size() == Pb.size());
+
+      if(func_id<=0) {
+        std::vector<Mat> Fa(basis.size()), Fb(basis.size());
+        for(size_t l=0;l<basis.size();l++) {
+          Fa[l] = Mat::Zero(basis[l]->nbf(),basis[l]->nbf());
+          Fb[l] = Mat::Zero(basis[l]->nbf(),basis[l]->nbf());
+        }
+        return std::make_tuple(T(0),Fa,Fb);
+      }
+
+      IntegratorXX::TreutlerAhlrichs<double,double> quad(N);
+      const auto & quad_w = quad.weights();
+      const auto & quad_r = quad.points();
+      Eigen::VectorXd wd = Eigen::Map<const Eigen::VectorXd>(quad_w.data(), quad_w.size());
+      Eigen::VectorXd rd = Eigen::Map<const Eigen::VectorXd>(quad_r.data(), quad_r.size());
+      const T angfac = T(4)*T(M_PI);
+
+      std::vector<Mat> bf(basis.size()), df(basis.size());
+      for(size_t l=0;l<basis.size();l++) {
+        const Eigen::Matrix<T,Eigen::Dynamic,1> rT = rd.template cast<T>();
+        bf[l]=on_basis<T>(basis[l], [&rT](const auto & b){ return b.template eval_f_t<T>(rT); });
+        df[l]=on_basis<T>(basis[l], [&rT](const auto & b){ return b.template eval_df_t<T>(rT); });
+      }
+      const Vec w = wd.template cast<T>();
+      const Vec r = rd.template cast<T>();
+
+      Vec rho_a = Vec::Zero(r.size()), rho_b = Vec::Zero(r.size());
+      for(size_t l=0;l<basis.size();l++) {
+        rho_a += (bf[l]*Pa[l]/angfac*bf[l].transpose()).diagonal();
+        rho_b += (bf[l]*Pb[l]/angfac*bf[l].transpose()).diagonal();
+      }
+      const Vec rhotot = rho_a + rho_b;
+
+      Vec drho_a = Vec::Zero(r.size()), drho_b = Vec::Zero(r.size());
+      for(size_t l=0;l<basis.size();l++) {
+        drho_a += T(2)*(df[l]*Pa[l]/angfac*bf[l].transpose()).diagonal();
+        drho_b += T(2)*(df[l]*Pb[l]/angfac*bf[l].transpose()).diagonal();
+      }
+
+      Vec tau_a = Vec::Zero(r.size()), tau_b = Vec::Zero(r.size());
+      for(size_t l=0;l<basis.size();l++) {
+        tau_a += T(0.5)*(df[l]*Pa[l]/angfac*df[l].transpose()).diagonal();
+        tau_b += T(0.5)*(df[l]*Pb[l]/angfac*df[l].transpose()).diagonal();
+      }
+      for(size_t l=1;l<basis.size();l++) {
+        tau_a.array() += T(0.5)*T(l)*T(l+1)*(bf[l]*Pa[l]/angfac*bf[l].transpose()).diagonal().array() / r.array().square();
+        tau_b.array() += T(0.5)*T(l)*T(l+1)*(bf[l]*Pb[l]/angfac*bf[l].transpose()).diagonal().array() / r.array().square();
+      }
+
+      // Down to double for libxc, in the column layout it expects.
+      Eigen::MatrixXd rho_d(r.size(),2), sigma_d(r.size(),3), tau_d(r.size(),2);
+      rho_d.col(0) = rho_a.template cast<double>();
+      rho_d.col(1) = rho_b.template cast<double>();
+      sigma_d.col(0) = (drho_a.array()*drho_a.array()).matrix().template cast<double>();
+      sigma_d.col(1) = (drho_a.array()*drho_b.array()).matrix().template cast<double>();
+      sigma_d.col(2) = (drho_b.array()*drho_b.array()).matrix().template cast<double>();
+      tau_d.col(0) = tau_a.template cast<double>();
+      tau_d.col(1) = tau_b.template cast<double>();
+
+      Eigen::VectorXd exc_d;
+      Eigen::MatrixXd vxc_d, vsigma_d, vtau_d;
+      auto ggamgga = eval_xc(rho_d, sigma_d, tau_d, exc_d, vxc_d, vsigma_d, vtau_d, func_id, XC_POLARIZED);
+      const bool gga = std::get<0>(ggamgga);
+      const bool mgga = std::get<1>(ggamgga);
+      const Vec exc = exc_d.template cast<T>();
+
+      T E = T(0);
+      for(Eigen::Index ig=0; ig<r.size(); ig++)
+        E += exc(ig) * rhotot(ig) * w(ig) * r(ig) * r(ig);
+      E *= angfac;
+
+      const Vec r2 = r.array().square().matrix();
+      const Vec w_r2 = (w.array()*r2.array()).matrix();
+      const Vec vxc_a = vxc_d.col(0).template cast<T>();
+      const Vec vxc_b = vxc_d.col(1).template cast<T>();
+
+      std::vector<Mat> Fa(basis.size()), Fb(basis.size());
+      for(size_t l=0;l<basis.size();l++) {
+        Vec da = (w_r2.array()*vxc_a.array()).matrix();
+        Vec db = (w_r2.array()*vxc_b.array()).matrix();
+        Fa[l] = bf[l].transpose() * da.asDiagonal() * bf[l];
+        Fb[l] = bf[l].transpose() * db.asDiagonal() * bf[l];
+      }
+      if(gga) {
+        const Vec vs0 = vsigma_d.col(0).template cast<T>();
+        const Vec vs1 = vsigma_d.col(1).template cast<T>();
+        const Vec vs2 = vsigma_d.col(2).template cast<T>();
+        for(size_t l=0;l<basis.size();l++) {
+          Vec da = (w_r2.array()*(T(2)*vs0.array()*drho_a.array() + vs1.array()*drho_b.array())).matrix();
+          Mat Fagga = df[l].transpose() * da.asDiagonal() * bf[l];
+          Fa[l] += Fagga + Fagga.transpose();
+          Vec db = (w_r2.array()*(T(2)*vs2.array()*drho_b.array() + vs1.array()*drho_a.array())).matrix();
+          Mat Fbgga = df[l].transpose() * db.asDiagonal() * bf[l];
+          Fb[l] += Fbgga + Fbgga.transpose();
+        }
+      }
+      if(mgga) {
+        const Vec vt0 = vtau_d.col(0).template cast<T>();
+        const Vec vt1 = vtau_d.col(1).template cast<T>();
+        for(size_t l=0;l<basis.size();l++) {
+          Vec da = (w_r2.array()*vt0.array()).matrix();
+          Vec db = (w_r2.array()*vt1.array()).matrix();
+          Fa[l] += T(0.5)*df[l].transpose() * da.asDiagonal() * df[l];
+          Fb[l] += T(0.5)*df[l].transpose() * db.asDiagonal() * df[l];
+          if(l>0) {
+            Vec da2 = (w.array()*vt0.array()).matrix();
+            Vec db2 = (w.array()*vt1.array()).matrix();
+            Fa[l] += T(0.5)*T(l)*T(l+1)*bf[l].transpose() * da2.asDiagonal() * bf[l];
+            Fb[l] += T(0.5)*T(l)*T(l+1)*bf[l].transpose() * db2.asDiagonal() * bf[l];
+          }
+        }
+      }
+      return std::make_tuple(E,Fa,Fb);
+    }
+
+    /// Restricted atomic SCF carried at an arbitrary precision.
+    ///
+    /// The point of it is diagnostic. The occupation refinement has to
+    /// tell iterates apart by energy differences around 1e-10, and in
+    /// double the Fock builder reproduces its own answer only to about
+    /// 1e-9 -- so the phase that divides a fractionally occupied shell
+    /// is deciding on arithmetic noise. Raising the precision of the
+    /// whole loop, builder and solver together, says what the
+    /// algorithm does when nothing is masked.
+    template<typename T>
+    OpenOrbitalOptimizer::SCFSolver<T, T>
+    restricted_scf_at(int Z, int Q, int x_func_id, int c_func_id, int Ngrid,
+                      double linear_dependency_threshold,
+                      double convergence_threshold,
+                      const std::vector<std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasis>> & radial_basis,
+                      int verbosity, bool oda, double oda_degeneracy_threshold,
+                      int maxiter, const std::string & methods_override) {
+      using Mat = Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>;
+
+      std::vector<Mat> X = form_X_at<T>(linear_dependency_threshold, radial_basis);
+      std::vector<std::pair<Mat,Mat>> Hcore = form_core_hamiltonian_at<T>(radial_basis, Z);
+
+      OpenOrbitalOptimizer::IndexVector number_of_blocks_per_particle_type(1);
+      number_of_blocks_per_particle_type(0) = static_cast<Eigen::Index>(radial_basis.size());
+
+      OpenOrbitalOptimizer::Vector<T> maximum_occupation(radial_basis.size());
+      for(size_t l=0;l<radial_basis.size();l++)
+        maximum_occupation(l) = T(2*(2*l+1));
+
+      OpenOrbitalOptimizer::Vector<T> number_of_particles(1);
+      number_of_particles(0) = T(Z-Q);
+
+      std::vector<std::string> block_descriptions(radial_basis.size());
+      for(size_t l=0;l<radial_basis.size();l++) {
+        std::ostringstream oss;
+        oss << "l=" << l;
+        block_descriptions[l] = oss.str();
+      }
+
+      OpenOrbitalOptimizer::FockMatrix<T> fock_guess(radial_basis.size());
+      for(size_t i=0;i<X.size();i++)
+        fock_guess[i] = X[i].transpose() * (Hcore[i].first+Hcore[i].second) * X[i];
+
+      OpenOrbitalOptimizer::FockBuilder<T, T> fock_builder =
+        [radial_basis, X, Ngrid, x_func_id, c_func_id, Hcore](const OpenOrbitalOptimizer::DensityMatrix<T, T> & dm) {
+        const auto & orbitals = dm.first;
+        const auto & occupations = dm.second;
+
+        std::vector<Mat> P(orbitals.size());
+        for(size_t l=0;l<P.size();l++) {
+          P[l] = orbitals[l] * occupations[l].asDiagonal() * orbitals[l].transpose();
+          P[l] = X[l] * P[l] * X[l].transpose();
+        }
+
+        auto coulomb = build_J_scalar<T>(radial_basis, radial_basis, P);
+        auto exchange = build_xc_unpolarized_scalar<T>(radial_basis, P, Ngrid, x_func_id);
+        auto correlation = build_xc_unpolarized_scalar<T>(radial_basis, P, Ngrid, c_func_id);
+
+        OpenOrbitalOptimizer::FockMatrix<T> fock(orbitals.size());
+        for(size_t l=0; l<fock.size(); l++)
+          fock[l] = X[l].transpose() * (Hcore[l].first + Hcore[l].second + coulomb[l]
+                                        + std::get<1>(exchange)[l] + std::get<1>(correlation)[l]) * X[l];
+
+        T Ekin = T(0), Enuc = T(0), Ej = T(0);
+        for(size_t l=0;l<P.size();l++) {
+          Ekin += (Hcore[l].first*P[l]).trace();
+          Enuc += (Hcore[l].second*P[l]).trace();
+          Ej += T(0.5)*(P[l]*coulomb[l]).trace();
+        }
+        const T Etot = Ekin + Enuc + Ej + std::get<0>(exchange) + std::get<0>(correlation);
+        return OpenOrbitalOptimizer::FockBuilderReturn<T, T>{Etot, fock};
+      };
+
+      OpenOrbitalOptimizer::SCFSolver<T, T> scfsolver(number_of_blocks_per_particle_type,
+                                                      maximum_occupation, number_of_particles,
+                                                      fock_builder, block_descriptions);
+      scfsolver.set("verbosity", verbosity);
+      scfsolver.set("convergence_threshold", T(convergence_threshold));
+      scfsolver.set("maximum_iterations", maxiter);
+      if(oda_degeneracy_threshold > 0)
+        scfsolver.set("optimal_damping_degeneracy_threshold", T(oda_degeneracy_threshold));
+      scfsolver.initialize_with_fock(fock_guess);
+      if(!methods_override.empty())
+        scfsolver.set("methods", methods_override);
+      else if(oda)
+        scfsolver.set("methods", std::string("ODA + CG"));
+      apply_settings_override(scfsolver);
+      scfsolver.run();
+      return scfsolver;
     }
 
     OpenOrbitalOptimizer::SCFSolver<double, double> restricted_scf(int Z, int Q, int x_func_id, int c_func_id, int Ngrid, double linear_dependency_threshold, double convergence_threshold, const std::vector<std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasis>> & radial_basis, int verbosity, bool core_excitation, bool oda, double oda_degeneracy_threshold, int maxiter, const std::string & methods_override) {
@@ -589,6 +1059,7 @@ namespace OpenOrbitalOptimizer {
         scfsolver.set("methods", methods_override);
       else if(oda)
         scfsolver.set("methods", std::string("ODA + CG"));
+      apply_settings_override(scfsolver);
       scfsolver.run();
 
       if(core_excitation) {
@@ -606,7 +1077,8 @@ namespace OpenOrbitalOptimizer {
           scfsolver.set("methods", methods_override);
         else if(oda)
           scfsolver.set("methods", std::string("ODA + CG"));
-        scfsolver.run();
+        apply_settings_override(scfsolver);
+      scfsolver.run();
         auto core_hole_fock_build = scfsolver.get_fock_build();
         printf("1s double ionization energy % .3f eV\n",(core_hole_fock_build.first-fock_build.first)*27.2114);
       }
@@ -696,10 +1168,125 @@ namespace OpenOrbitalOptimizer {
         scfsolver.set("methods", methods_override);
       else if(oda)
         scfsolver.set("methods", std::string("ODA + CG"));
+      apply_settings_override(scfsolver);
       scfsolver.run();
       return scfsolver;
     }
 #endif
+
+    /// Unrestricted atomic SCF carried at an arbitrary precision.
+    /// Companion to restricted_scf_at; see the note there for why.
+    template<typename T>
+    OpenOrbitalOptimizer::SCFSolver<T, T>
+    unrestricted_scf_at(int Z, int Q, int M, int x_func_id, int c_func_id, int Ngrid,
+                        double linear_dependency_threshold, double convergence_threshold,
+                        const std::vector<std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasis>> & radial_basis,
+                        int verbosity, bool oda, double oda_degeneracy_threshold,
+                        int maxiter, const std::string & methods_override) {
+      using Mat = Eigen::Matrix<T,Eigen::Dynamic,Eigen::Dynamic>;
+
+      std::vector<Mat> X = form_X_at<T>(linear_dependency_threshold, radial_basis);
+      std::vector<std::pair<Mat,Mat>> Hcore = form_core_hamiltonian_at<T>(radial_basis, Z);
+
+      OpenOrbitalOptimizer::IndexVector number_of_blocks_per_particle_type(2);
+      number_of_blocks_per_particle_type(0) = static_cast<Eigen::Index>(radial_basis.size());
+      number_of_blocks_per_particle_type(1) = static_cast<Eigen::Index>(radial_basis.size());
+
+      OpenOrbitalOptimizer::Vector<T> maximum_occupation(2*radial_basis.size());
+      for(size_t l=0;l<radial_basis.size();l++)
+        maximum_occupation(l) = T(2*l+1);
+      for(size_t i=0;i<radial_basis.size();i++)
+        maximum_occupation(i+radial_basis.size()) = maximum_occupation(i);
+
+      const bool even_number_of_electrons = ((Z-Q)%2==0);
+      const bool even_multiplicity = (((M-1)%2)==0);
+      if(even_number_of_electrons != even_multiplicity) {
+        std::ostringstream oss;
+        oss << "Cannot have multiplicity " << M << " with " << Z-Q << " electrons!\n";
+        throw std::logic_error(oss.str());
+      }
+      const int Nela = (Z-Q+M-1)/2;
+      const int Nelb = (Z-Q)-Nela;
+      printf("Nela = %i Nelb = %i\n",Nela,Nelb);
+      OpenOrbitalOptimizer::Vector<T> number_of_particles(2);
+      number_of_particles(0) = T(Nela);
+      number_of_particles(1) = T(Nelb);
+
+      std::vector<std::string> block_descriptions(2*radial_basis.size());
+      for(size_t l=0;l<radial_basis.size();l++) {
+        std::ostringstream oss;
+        oss << "alpha l=" << l;
+        block_descriptions[l] = oss.str();
+      }
+      for(size_t l=0;l<radial_basis.size();l++) {
+        std::ostringstream oss;
+        oss << "beta l=" << l;
+        block_descriptions[l+radial_basis.size()] = oss.str();
+      }
+
+      OpenOrbitalOptimizer::FockMatrix<T> fock_guess(2*radial_basis.size());
+      for(size_t i=0;i<X.size();i++) {
+        fock_guess[i] = X[i].transpose() * (Hcore[i].first+Hcore[i].second) * X[i];
+        fock_guess[i+radial_basis.size()] = fock_guess[i];
+      }
+
+      OpenOrbitalOptimizer::FockBuilder<T, T> fock_builder =
+        [radial_basis, X, Ngrid, x_func_id, c_func_id, Hcore](const OpenOrbitalOptimizer::DensityMatrix<T, T> & dm) {
+        const auto & orbitals = dm.first;
+        const auto & occupations = dm.second;
+        assert(orbitals.size()%2==0);
+        const size_t Nblocks = orbitals.size()/2;
+
+        std::vector<Mat> Pa(Nblocks), Pb(Nblocks), Ptot(Nblocks);
+        for(size_t iblock=0; iblock<Nblocks; iblock++) {
+          const size_t ablock = iblock, bblock = iblock+Nblocks;
+          Pa[iblock] = orbitals[ablock] * occupations[ablock].asDiagonal() * orbitals[ablock].transpose();
+          Pa[iblock] = X[iblock] * Pa[iblock] * X[iblock].transpose();
+          Pb[iblock] = orbitals[bblock] * occupations[bblock].asDiagonal() * orbitals[bblock].transpose();
+          Pb[iblock] = X[iblock] * Pb[iblock] * X[iblock].transpose();
+          Ptot[iblock] = Pa[iblock] + Pb[iblock];
+        }
+
+        auto coulomb = build_J_scalar<T>(radial_basis, radial_basis, Ptot);
+        auto exchange = build_xc_polarized_scalar<T>(radial_basis, Pa, Pb, Ngrid, x_func_id);
+        auto correlation = build_xc_polarized_scalar<T>(radial_basis, Pa, Pb, Ngrid, c_func_id);
+
+        OpenOrbitalOptimizer::FockMatrix<T> fock(orbitals.size());
+        for(size_t iblock=0; iblock<Nblocks; iblock++) {
+          const size_t ablock = iblock, bblock = iblock+Nblocks;
+          fock[ablock] = X[iblock].transpose() * (Hcore[iblock].first + Hcore[iblock].second + coulomb[iblock]
+                          + std::get<1>(exchange)[iblock] + std::get<1>(correlation)[iblock]) * X[iblock];
+          fock[bblock] = X[iblock].transpose() * (Hcore[iblock].first + Hcore[iblock].second + coulomb[iblock]
+                          + std::get<2>(exchange)[iblock] + std::get<2>(correlation)[iblock]) * X[iblock];
+        }
+
+        T Ekin = T(0), Enuc = T(0), Ej = T(0);
+        for(size_t l=0;l<Ptot.size();l++) {
+          Ekin += (Hcore[l].first*Ptot[l]).trace();
+          Enuc += (Hcore[l].second*Ptot[l]).trace();
+          Ej += T(0.5)*(Ptot[l]*coulomb[l]).trace();
+        }
+        const T Etot = Ekin + Enuc + Ej + std::get<0>(exchange) + std::get<0>(correlation);
+        return OpenOrbitalOptimizer::FockBuilderReturn<T, T>{Etot, fock};
+      };
+
+      OpenOrbitalOptimizer::SCFSolver<T, T> scfsolver(number_of_blocks_per_particle_type,
+                                                      maximum_occupation, number_of_particles,
+                                                      fock_builder, block_descriptions);
+      scfsolver.set("verbosity", verbosity);
+      scfsolver.set("convergence_threshold", T(convergence_threshold));
+      scfsolver.set("maximum_iterations", maxiter);
+      if(oda_degeneracy_threshold > 0)
+        scfsolver.set("optimal_damping_degeneracy_threshold", T(oda_degeneracy_threshold));
+      scfsolver.initialize_with_fock(fock_guess);
+      if(!methods_override.empty())
+        scfsolver.set("methods", methods_override);
+      else if(oda)
+        scfsolver.set("methods", std::string("ODA + CG"));
+      apply_settings_override(scfsolver);
+      scfsolver.run();
+      return scfsolver;
+    }
 
     OpenOrbitalOptimizer::SCFSolver<double, double> unrestricted_scf(int Z, int Q, int M, int x_func_id, int c_func_id, int Ngrid, double linear_dependency_threshold, double convergence_threshold, const std::vector<std::shared_ptr<const OpenOrbitalOptimizer::AtomicSolver::RadialBasis>> & radial_basis, int verbosity, bool core_excitation, bool oda, double oda_degeneracy_threshold, int maxiter, const std::string & methods_override) {
       // Form the orthogonal orbital basis
@@ -838,6 +1425,7 @@ namespace OpenOrbitalOptimizer {
         scfsolver.set("methods", methods_override);
       else if(oda)
         scfsolver.set("methods", std::string("ODA + CG"));
+      apply_settings_override(scfsolver);
       scfsolver.run();
 
       if(core_excitation) {
@@ -855,7 +1443,8 @@ namespace OpenOrbitalOptimizer {
           scfsolver.set("methods", methods_override);
         else if(oda)
           scfsolver.set("methods", std::string("ODA + CG"));
-        scfsolver.run();
+        apply_settings_override(scfsolver);
+      scfsolver.run();
         auto core_hole_fock_build = scfsolver.get_fock_build();
         printf("1s ionization energy % .3f eV\n",(core_hole_fock_build.first-fock_build.first)*27.2114);
       }
@@ -1056,6 +1645,7 @@ namespace OpenOrbitalOptimizer {
         scfsolver.set("methods", methods_override);
       else if(oda)
         scfsolver.set("methods", std::string("ODA + CG"));
+      apply_settings_override(scfsolver);
       scfsolver.run();
 
       if(core_excitation) {
@@ -1073,7 +1663,8 @@ namespace OpenOrbitalOptimizer {
           scfsolver.set("methods", methods_override);
         else if(oda)
           scfsolver.set("methods", std::string("ODA + CG"));
-        scfsolver.run();
+        apply_settings_override(scfsolver);
+      scfsolver.run();
         auto core_hole_fock_build = scfsolver.get_fock_build();
         printf("1s ionization energy % .3f eV\n",(core_hole_fock_build.first-fock_build.first)*27.2114);
       }
@@ -1236,6 +1827,7 @@ int main(int argc, char **argv) {
   parser.add<std::string>("xfunc", 0, "exchange functional", true);
   parser.add<std::string>("cfunc", 0, "correlation functional", true);
   parser.add<std::string>("epcfunc", 0, "electron-proton correlation functional", false, "");
+  parser.add<std::string>("precision", 0, "arithmetic for the SCF loop and the Fock builder: double, longdouble or quad", false, "double");
   parser.add<bool>("sto", 0, "Use STO instead of GTO?", false, false);
   parser.add<bool>("excitecore", 0, "Calculate core excitation?", false, false);
   parser.add<std::string>("basis", 0, "electronic basis set", true);
@@ -1247,6 +1839,10 @@ int main(int argc, char **argv) {
   parser.add<bool>("quad", 0, "run the solver in quad precision (the Fock build stays double)", false, false);
   parser.add<bool>("oda", 0, "Use optimal damping for SCF?", false, false);
   parser.add<std::string>("methods", 0, "SCF method mix (e.g. \"LCIIS + ODA + CG\"); empty = driver default", false, "");
+  parser.add<std::string>("set", 0, "extra solver settings as key=value[,key=value]", false, "");
+  parser.add<double>("reference-energy", 0, "total energy the run must reproduce; omitted = not checked", false, 0.0);
+  parser.add<double>("energy-tolerance", 0, "tolerance on --reference-energy", false, 1e-8);
+  parser.add<double>("max-fermi-level-error", 0, "largest tolerated occupation stationarity residual; negative = not checked", false, -1.0);
   parser.add<double>("odadegthresh", 0, "Energy gap below which orbitals are treated as degenerate in optimal damping (0 = use solver default)", false, 0.0);
   parser.parse_check(argc, argv);
 
@@ -1266,6 +1862,11 @@ int main(int argc, char **argv) {
   bool quad = parser.get<bool>("quad");
   bool oda = parser.get<bool>("oda");
   std::string methods_override = parser.get<std::string>("methods");
+  const bool check_energy = parser.exist("reference-energy");
+  const double reference_energy = parser.get<double>("reference-energy");
+  const double energy_tolerance = parser.get<double>("energy-tolerance");
+  const double max_fermi_level_error = parser.get<double>("max-fermi-level-error");
+  g_settings_override = parser.get<std::string>("set");
   double oda_degeneracy_threshold = parser.get<double>("odadegthresh");
   std::string basisfile = parser.get<std::string>("basis");
   std::string pbasisfile = parser.get<std::string>("pbasis");
@@ -1273,6 +1874,7 @@ int main(int argc, char **argv) {
   std::string xfunc = parser.get<std::string>("xfunc");
   std::string cfunc = parser.get<std::string>("cfunc");
   std::string epcfunc = parser.get<std::string>("epcfunc");
+  const std::string precision = parser.get<std::string>("precision");
 
   int x_func_id, c_func_id, epc_func_id;
   if(not xfunc.empty() and std::all_of(xfunc.begin(), xfunc.end(), ::isdigit)) {
@@ -1322,11 +1924,12 @@ int main(int argc, char **argv) {
   // convergence_threshold is tightened, so this is checked here rather
   // than folded into the SCF convergence test.
   auto check_particle_number =
-    [&](const OpenOrbitalOptimizer::SCFSolver<double, double> & scfsolver) {
+    [&](const auto & scfsolver) {
       auto occupations = scfsolver.get_orbital_occupations();
       double total = 0.0;
       for(size_t iblock = 0; iblock < occupations.size(); iblock++)
-        total += occupations[iblock].sum();
+        for(Eigen::Index k = 0; k < occupations[iblock].size(); k++)
+          total += (double) occupations[iblock](k);
       const double expected = Z - Q;
       // Sized to sit between the two regimes rather than at a round
       // number: with the occupations conserved the residual is pure
@@ -1340,6 +1943,38 @@ int main(int argc, char **argv) {
         printf("Particle number is not conserved: |difference| %e exceeds %e\n",
                std::abs(total - expected), tolerance);
         return false;
+      }
+
+      // Without these a regression test only asserts that the driver
+      // did not crash: the run can converge to the wrong answer, or
+      // not converge at all, and still be reported as a pass.
+      if(!scfsolver.converged()) {
+        printf("SCF did not converge.\n");
+        return false;
+      }
+      if(check_energy) {
+        const double energy = (double) scfsolver.get_energy();
+        printf("Energy % .10f, reference % .10f, difference %e\n",
+               energy, reference_energy, energy - reference_energy);
+        if(std::abs(energy - reference_energy) > energy_tolerance) {
+          printf("Energy differs from the reference by more than %e\n",
+                 energy_tolerance);
+          return false;
+        }
+      }
+      if(max_fermi_level_error >= 0.0) {
+        // The occupations of a fractionally filled shell are only
+        // determined once the orbitals sharing the Fermi level have a
+        // common orbital energy; without this the shell can settle
+        // anywhere along a very flat valley and the energy alone will
+        // not say so.
+        const double residual = (double) scfsolver.get_real("fermi_level_error");
+        printf("Fermi-level error %e, tolerance %e\n", residual,
+               max_fermi_level_error);
+        if(residual > max_fermi_level_error) {
+          printf("Occupations are not stationary.\n");
+          return false;
+        }
       }
       return true;
     };
@@ -1372,9 +2007,29 @@ int main(int argc, char **argv) {
 #else
       throw std::logic_error("This build has no _Float128 support; --quad is unavailable.\n");
 #endif
+    } else if(M<=1 && precision == "quad") {
+#ifdef OPENORBOPT_QUAD
+      conserved = check_particle_number(
+        OpenOrbitalOptimizer::AtomicSolver::restricted_scf_at<_Float128>(Z, Q, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, oda, oda_degeneracy_threshold, maxiter, methods_override));
+#else
+      throw std::logic_error("This build has no _Float128 support; --precision quad is unavailable.\n");
+#endif
+    } else if(precision == "quad") {
+#ifdef OPENORBOPT_QUAD
+      conserved = check_particle_number(
+        OpenOrbitalOptimizer::AtomicSolver::unrestricted_scf_at<_Float128>(Z, Q, M, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, oda, oda_degeneracy_threshold, maxiter, methods_override));
+#else
+      throw std::logic_error("This build has no _Float128 support; --precision quad is unavailable.\n");
+#endif
+    } else if(M<=1 && precision == "longdouble") {
+      conserved = check_particle_number(
+        OpenOrbitalOptimizer::AtomicSolver::restricted_scf_at<long double>(Z, Q, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, oda, oda_degeneracy_threshold, maxiter, methods_override));
     } else if(M<=1) {
       conserved = check_particle_number(
         OpenOrbitalOptimizer::AtomicSolver::restricted_scf(Z, Q, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, core_excitation, oda, oda_degeneracy_threshold, maxiter, methods_override));
+    } else if(precision == "longdouble") {
+      conserved = check_particle_number(
+        OpenOrbitalOptimizer::AtomicSolver::unrestricted_scf_at<long double>(Z, Q, M, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, oda, oda_degeneracy_threshold, maxiter, methods_override));
     } else {
       conserved = check_particle_number(
         OpenOrbitalOptimizer::AtomicSolver::unrestricted_scf(Z, Q, M, x_func_id, c_func_id, Ngrid, linear_dependency_threshold, convergence_threshold, radial_basis, verbosity, core_excitation, oda, oda_degeneracy_threshold, maxiter, methods_override));
