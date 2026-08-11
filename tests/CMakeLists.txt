@@ -51,9 +51,20 @@ add_test(  # Test #4
   NAME openorbopt/atomtest/iron-unrestricted
   COMMAND $<TARGET_FILE:openorbopt-atomtest> --Z 26 --M 5 --xfunc GGA_X_PBE --cfunc GGA_C_PBE --basis "${CMAKE_CURRENT_SOURCE_DIR}/cc-pvdz.json" --methods "ODA + ARH" --reference-energy -1263.4350147950 --energy-tolerance 1e-7 --max-fermi-level-error 1e-5
   )
+# The restricted atom is held to a looser gradient than the default
+# and a tighter Fermi-level residual, which is the trade this case
+# actually offers. Settling its occupations perturbs the orbitals, and
+# winning that back is worth about g^2/2H in energy -- some 1e-12 at
+# the gradient reached here, three orders under what the Fock builder
+# reproduces. So the last factor of two in the gradient cannot be paid
+# for by any step a line search can verify, and demanding it would
+# only mean reporting the unsettled occupations instead: this case
+# used to pass with a Fermi-level error of 0.13. Asking for 2e-6 in
+# the gradient and 1e-5 in the residual asks for what is reachable,
+# and for the physics the test exists to check.
 add_test(  # Test #5
   NAME openorbopt/atomtest/iron-restricted
-  COMMAND $<TARGET_FILE:openorbopt-atomtest> --Z 26 --M 0 --xfunc GGA_X_PBE --cfunc GGA_C_PBE --basis "${CMAKE_CURRENT_SOURCE_DIR}/cc-pvdz.json" --methods "ODA + ARH" --reference-energy -1263.3342431303 --energy-tolerance 1e-6 --max-fermi-level-error 1e-4
+  COMMAND $<TARGET_FILE:openorbopt-atomtest> --Z 26 --M 0 --xfunc GGA_X_PBE --cfunc GGA_C_PBE --basis "${CMAKE_CURRENT_SOURCE_DIR}/cc-pvdz.json" --methods "ODA + ARH" --convthr 2e-6 --reference-energy -1263.3342431303 --energy-tolerance 1e-6 --max-fermi-level-error 1e-5
   )
 set_tests_properties(
   openorbopt/atomtest/run1

@@ -27,6 +27,35 @@
       integrals.
 
 #### Enhancements (continued)
+* The Aufbau cleanup is adopted on the energy alone. A rise smaller
+  than the convergence threshold is not evidence of a preference for
+  the mixed density, so it no longer blocks the swap, and the gradient
+  is not consulted at all.
+    - Making the swap conditional on keeping ``converged()`` meant
+      refusing an occupation state five orders better because it left
+      the gradient eight per cent over its threshold. On a
+      spin-restricted iron atom the cleanup reached a Fermi-level
+      residual of 4.3e-7 at a gradient of 1.08e-6, and what was
+      reported instead was the mixed density it started from, whose
+      residual is 0.13. That is not a safer answer, it is a wrong one
+      in the other variable, reported as converged.
+    - The cost is that a run can finish with the occupations right and
+      the gradient a little short, and say so. Settling the
+      occupations perturbs the orbitals, and winning that back is
+      worth about g^2/2H -- around 1e-12 at the gradients in question,
+      three orders under what a Fock builder in double reproduces --
+      so no line search can pay for it. The iron test at M = 0 is
+      therefore held to a gradient of 2e-6 and a Fermi-level residual
+      of 1e-5, which is what the case can actually reach.
+    - Attempting the cleanup *earlier*, while the SCF still has
+      descent to spend on the repair, was tried and does not work. On
+      four cases -- iron and a La+ cation, each spin-restricted and
+      spin-polarised -- no trigger gradient succeeds everywhere, and
+      several converge to different and higher minima: La+ restricted
+      lands 2.6e-4 Eh high at one setting and La+ polarised 3.8e-2 Eh
+      high at another. The conditions are written in orbital energies,
+      and imposing them before the orbitals are converged imposes them
+      on numbers that do not yet mean anything.
 * The relaxed polytope search no longer walks by default. New setting
   ``relaxed_occupation_refinements`` (default 0, was effectively 4)
   says how many times it re-anchors its quadratic model and steps on

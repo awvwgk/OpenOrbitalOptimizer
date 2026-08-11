@@ -6061,16 +6061,31 @@ namespace OpenOrbitalOptimizer {
       number_of_fock_evaluations_ =
           saved_fock_evaluations + cleanup_fock_evaluations;
 
-      // Accept unless the Aufbau state is worse by an amount the SCF
-      // itself would act on. Demanding a strict improvement throws away
-      // exactly-Aufbau occupations to defend an energy difference
-      // smaller than the descent the solver already calls noise, which
-      // is the wrong trade: the occupations are the point of the step,
-      // and an energy difference below that scale is not evidence of a
-      // preference for the mixed density.
-      const Tbase tolerance = minimum_useful_descent_();
-      if(aufbau_energy <= reference_energy + tolerance
-         && !(must_stay_converged && !converged())) {
+      // Adopt the cleanup whenever it does not cost real energy, and
+      // judge that on the energy alone.
+      //
+      // The occupations are what this step is for. An energy
+      // difference below the convergence threshold is not evidence of
+      // a preference for the mixed density -- it is smaller than the
+      // scale on which the whole calculation is being decided -- so a
+      // rise inside it is not a reason to refuse.
+      //
+      // The gradient is not consulted, and that is the change. Making
+      // the swap conditional on keeping converged() meant refusing an
+      // occupation state five orders better because it left the
+      // gradient eight per cent over its threshold: on a
+      // spin-restricted iron atom the cleanup reached a Fermi-level
+      // residual of 4.3e-7 at a gradient of 1.08e-6, and what was
+      // reported instead was the mixed density it started from, whose
+      // residual is 0.13. Defending the gradient criterion that way
+      // does not make the answer better, it makes it wrong in the
+      // other variable and hides the fact.
+      //
+      // The consequence is that a run can now finish with the
+      // occupations right and the gradient a little short, and say so.
+      // That is a more honest report than the reverse.
+      const Tbase tolerance = effective_convergence_threshold_();
+      if(aufbau_energy <= reference_energy + tolerance) {
         log_(5, "Aufbau cleanup accepted, energy change %e\n",
              (double) (aufbau_energy - reference_energy));
         return true;
