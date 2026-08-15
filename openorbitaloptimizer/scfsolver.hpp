@@ -1413,7 +1413,7 @@ namespace OpenOrbitalOptimizer {
     /// of order eps * ||F||_F (C is unitary, ||P|| <= 1). Assemble a
     /// mock error vector at that bound and reduce with the active
     /// error norm so the returned value is directly comparable to
-    /// norm(diis_error_vector(0)).
+    /// diis_error_norm().
     Tbase compute_noise_floor() const {
       const Tbase eps = std::numeric_limits<Tbase>::epsilon();
       std::vector<Matrix<Torb>> mock(number_of_blocks_);
@@ -6031,11 +6031,11 @@ namespace OpenOrbitalOptimizer {
         // dropped over it, a gain of 7e-7 Eh on iron going with it.
         log_(5, "Aufbau cleanup: the refined occupations leave the gradient"
                 " at %e; relaxing the orbitals at them.\n",
-             (double) norm(diis_error_vector(0)));
+             (double) diis_error_norm());
         for(size_t attempt = 0; attempt < 4 && !converged(); attempt++)
           relax_orbitals_at_fixed_occupations_(allowed);
         log_(5, "Aufbau cleanup: gradient now %e, %s.\n",
-             (double) norm(diis_error_vector(0)),
+             (double) diis_error_norm(),
              converged() ? "converged" : "still short");
       }
 
@@ -6904,6 +6904,24 @@ namespace OpenOrbitalOptimizer {
       return worst;
     }
 
+    /// Norm of the error vector of the ihist:th history entry -- the
+    /// quantity converged() compares against the threshold.
+    ///
+    /// Defaults to the current iterate. The index is there because
+    /// picking among stored iterates on their gradients is something
+    /// the solver already does when a walk stalls, and something a
+    /// caller may want for the same reason: whether the gradient of a
+    /// given entry clears the threshold is not always a question the
+    /// solver's own verdict answers, since the occupation cleanup can
+    /// spend gradient on settling the occupations and the repair --
+    /// worth about g^2/2H, far under what a Fock builder reproduces --
+    /// cannot be verified by any line search.
+    Tbase diis_error_norm(size_t ihist=0) const {
+      if(ihist>=orbital_history_.size())
+        throw std::logic_error("Invalid entry!\n");
+      return norm(diis_error_vector(ihist));
+    }
+
     /// Check if we are converged
     bool converged() const {
         // Nothing has been iterated yet, so trivially not converged.
@@ -6917,12 +6935,11 @@ namespace OpenOrbitalOptimizer {
             // Data to pass to callback function
             std::map<std::string, std::any> callback_data;
             callback_data["dE"] = get_energy() - old_energy_;
-            callback_data["diis_error"] = norm(diis_error_vector(0));
+            callback_data["diis_error"] = diis_error_norm();
 
             return callback_convergence_function_(callback_data);
         } else {
-            return norm(diis_error_vector(0))
-                <= effective_convergence_threshold_();
+            return diis_error_norm() <= effective_convergence_threshold_();
         }
     }
 
@@ -7173,7 +7190,7 @@ namespace OpenOrbitalOptimizer {
       bool oda_failed = false, rotation_failed = false;
       for(size_t iteration=1; iteration <= maximum_iterations_; iteration++) {
         // Compute DIIS error
-        Tbase diis_error = norm(diis_error_vector(0));
+        Tbase diis_error = diis_error_norm();
         Tbase diis_max_error = diis_error_vector(0).template lpNorm<Eigen::Infinity>();
         Tbase dE = get_energy() - old_energy_;
 
@@ -7456,9 +7473,9 @@ namespace OpenOrbitalOptimizer {
             // somewhere to go is affected.
             if(orbital_history_.size() > 1) {
               size_t best_index = 0;
-              Tbase best_gradient = norm(diis_error_vector(0));
+              Tbase best_gradient = diis_error_norm();
               for(size_t ihist = 1; ihist < orbital_history_.size(); ihist++) {
-                const Tbase gradient = norm(diis_error_vector(ihist));
+                const Tbase gradient = diis_error_norm(ihist);
                 if(gradient < best_gradient) {
                   best_gradient = gradient;
                   best_index = ihist;
@@ -7545,7 +7562,7 @@ namespace OpenOrbitalOptimizer {
       if(orbital_history_.size() == 0)
         run();
       else {
-        Tbase diis_error = norm(diis_error_vector(0));
+        Tbase diis_error = diis_error_norm();
         if(diis_error >= diis_threshold_)
           run();
       }
